@@ -1,21 +1,18 @@
-"""Fase 2 - Costuras como líneas RECTAS sobre la superficie. FUNCIONAL.
+"""Fase 2 - Costuras como GEODÉSICAS rectas sobre la superficie. FUNCIONAL.
 
-La costura que el usuario VE es una RECTA entre los puntos que clickeó, pegada
-a la superficie (no zigzaguea por aristas ni se va por el ruido del teselado):
-así puede trazar líneas limpias en las zonas que le importan. Cuanto más puntos
-ponga, más sigue la costura su trazo; entre dos puntos va derecho.
+La costura que el usuario VE es la GEODÉSICA exacta entre sus clics (la línea más
+recta sobre la superficie, que cruza triángulos): recta en lo plano, círculo
+máximo en lo redondo — como la espera el usuario. Requiere malla manifold;
+`mesh_io` ya quita las pocas caras no-manifold del teselado de STEP que antes
+hacían fallar el solver. Si aun así falla, cae a una RECTA pegada a la superficie.
 
 Para el CORTE interno (segmentación, que opera sobre aristas) se mantiene en
-paralelo el camino más corto por aristas (Dijkstra): el contorno del corte
-puede quedar un poco "sucio" (sigue aristas), pero la LÍNEA guía es recta.
-
-Nota: antes se usaba la geodésica exacta (potpourri3d/geometry-central), pero
-ese solver EXIGE una malla manifold y lanza en los teselados de STEP reales
-(arista duplicada) → toda la costura caía al zigzag por aristas. La recta
-pegada a la superficie es robusta y es lo que el usuario espera.
+paralelo el camino más corto por aristas (Dijkstra). El corte exacto por la
+línea (partir triángulos) es trabajo aparte (ver app/core/seam_cut.py).
 """
 
 import numpy as np
+import potpourri3d as pp3d
 import scipy.sparse as sp
 from scipy.sparse.csgraph import dijkstra
 
@@ -26,8 +23,43 @@ class SeamError(Exception):
     """Error de usuario al trazar una costura (vértices inválidos, etc.)."""
 
 
-# Cache indexado por versión de malla (no por id(mesh): ver Session.mesh_version)
+# Caches indexados por versión de malla (no por id(mesh): ver Session.mesh_version)
 _graph_cache: dict = {"version": None, "graph": None}
+_geo_cache: dict = {"version": None, "solver": None}
+
+
+def _geodesic_solver(mesh):
+    """Solver de geodésicas exactas (EdgeFlip), cacheado por malla. None si la
+    malla no es manifold (el solver lanza al construirse)."""
+    if _geo_cache["version"] == SESSION.mesh_version:
+        return _geo_cache["solver"]
+    try:
+        solver = pp3d.EdgeFlipGeodesicSolver(
+            np.asarray(mesh.vertices, dtype=np.float64),
+            np.asarray(mesh.faces, dtype=np.int64),
+        )
+    except Exception:
+        solver = None
+    _geo_cache.update(version=SESSION.mesh_version, solver=solver)
+    return solver
+
+
+def _geodesic_polyline(mesh, waypoints: list[int]) -> list[list[float]]:
+    """Geodésica exacta que pasa por los waypoints (para DIBUJAR). Cae a la recta
+    pegada a la superficie si el solver no está disponible (malla no-manifold)."""
+    solver = _geodesic_solver(mesh)
+    if solver is None:
+        return _straight_surface_polyline(mesh, waypoints)
+    try:
+        poly: list[list[float]] = []
+        for a, b in zip(waypoints, waypoints[1:]):
+            seg = np.asarray(solver.find_geodesic_path(v_start=int(a), v_end=int(b)))
+            if seg.size == 0:
+                raise ValueError("geodésica vacía")
+            poly.extend(seg.tolist() if not poly else seg.tolist()[1:])
+        return poly
+    except Exception:
+        return _straight_surface_polyline(mesh, waypoints)
 
 # Densidad de muestreo de la recta (mm entre puntos). Suficiente para que se
 # pegue a la superficie en zonas curvas sin saturar la polilínea.
@@ -136,8 +168,8 @@ def _path_payload(
         chain.extend(segment if not chain else segment[1:])
 
     edge_path = [(chain[i], chain[i + 1]) for i in range(len(chain) - 1)]
-    # Línea guía RECTA para DIBUJAR (pegada a la superficie, entre los clics)
-    polyline = _straight_surface_polyline(mesh, waypoints)
+    # Línea guía: geodésica exacta sobre la superficie (recta), fallback a recta
+    polyline = _geodesic_polyline(mesh, waypoints)
     return chain, edge_path, polyline
 
 

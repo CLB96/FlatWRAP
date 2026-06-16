@@ -90,6 +90,11 @@ def load_mesh(data: bytes, filename: str) -> MeshSummary:
     mesh.update_faces(mesh.nondegenerate_faces())
     mesh.update_faces(mesh.unique_faces())
     mesh.remove_unreferenced_vertices()
+    # Quitar caras NO-MANIFOLD (aristas compartidas por >2 caras): los teselados
+    # de STEP suelen traer una o dos, y rompen el solver de geodésicas exactas
+    # (geometry-central exige malla manifold). Quitar esas pocas caras deja un
+    # hueco mínimo y habilita la costura geodésica recta sobre la superficie.
+    mesh = _drop_nonmanifold_faces(mesh)
     # Winding consistente: un STL con caras mal orientadas hace que el
     # aplanado SLIM cuente falsos volteos (área con signo) y rechace un parche
     # que SÍ es aplanable. fix_normals deja una orientación coherente.
@@ -101,6 +106,38 @@ def load_mesh(data: bytes, filename: str) -> MeshSummary:
     SESSION.mesh_version += 1  # invalida caches por malla (selección/geodésicas)
 
     return _summary(mesh)
+
+
+def _drop_nonmanifold_faces(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    """Elimina las caras que tocan una arista no-manifold (>2 caras).
+
+    Devuelve una malla nueva sin esas caras (hueco mínimo). Si no hay ninguna,
+    devuelve la misma malla. Mantener la malla manifold habilita las geodésicas.
+    """
+    from collections import Counter
+
+    edges = np.sort(mesh.edges, axis=1)
+    counts = Counter(map(tuple, edges))
+    bad = {e for e, c in counts.items() if c > 2}
+    if not bad:
+        return mesh
+
+    faces = np.asarray(mesh.faces)
+    keep = np.ones(len(faces), dtype=bool)
+    for fi, (a, b, c) in enumerate(faces):
+        tri_edges = (
+            (min(a, b), max(a, b)),
+            (min(b, c), max(b, c)),
+            (min(c, a), max(c, a)),
+        )
+        if any(e in bad for e in tri_edges):
+            keep[fi] = False
+
+    clean = trimesh.Trimesh(
+        vertices=mesh.vertices.copy(), faces=faces[keep], process=False
+    )
+    clean.remove_unreferenced_vertices()
+    return clean
 
 
 def _summary(mesh: trimesh.Trimesh) -> MeshSummary:
