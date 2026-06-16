@@ -36,11 +36,21 @@ const Viewer = {
     this._applyUpAxis();
     this._createControls();
 
-    // Iluminación neutra para pieza automotriz
-    this.scene.add(new THREE.HemisphereLight(0xffffff, 0x223344, 0.9));
-    const dir = new THREE.DirectionalLight(0xffffff, 0.7);
-    dir.position.set(1, 2, 1.5);
-    this.scene.add(dir);
+    // Iluminación PAREJA (sin sombras fuertes): la prioridad es ver con
+    // claridad qué está y qué no seleccionado como Cara A, no el realismo.
+    // Ambiente sube todo el piso de luz; hemisférico con suelo claro evita
+    // las caras inferiores oscuras; varias direccionales de relleno desde
+    // octantes opuestos eliminan cualquier zona en penumbra.
+    this.scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+    this.scene.add(new THREE.HemisphereLight(0xffffff, 0xb8c2cc, 0.7));
+    const fills = [
+      [1, 2, 1.5], [-1.5, -1, 1], [0, -2, -1], [1.5, 0.5, -1.5],
+    ];
+    for (const [x, y, z] of fills) {
+      const d = new THREE.DirectionalLight(0xffffff, 0.32);
+      d.position.set(x, y, z);
+      this.scene.add(d);
+    }
 
     // Zoom al cursor (reemplaza el dolly por defecto de OrbitControls)
     this.renderer.domElement.addEventListener('wheel', (e) => {
