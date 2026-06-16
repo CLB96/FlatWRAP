@@ -1,0 +1,21 @@
+# FlatWrap backend - Python 3.10+
+# Instalar: pip install -r requirements.txt
+
+# API
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9        # upload de archivos
+
+# Geometría
+trimesh>=4.0.0                 # carga STL/OBJ/PLY/GLB/3MF, limpieza, decimación
+cascadio>=0.0.17              # lectura de STEP (NURBS) -> teselado fino (OpenCASCADE)
+fast-simplification>=0.1      # decimación de mallas grandes (>250k caras)
+numpy>=1.26.0
+scipy>=1.11.0                  # solvers dispersos (usado por igl/potpourri3d)
+potpourri3d>=1.1               # geodésicas (heat method) - Fase 2
+libigl>=2.5.1                  # parametrización ARAP/LSCM - Fase 4
+networkx>=3.0                  # conectividad de parches - Fase 3
+
+# Exportación
+ezdxf>=1.2.0                   # DXF escala 1:1 - Fase 5
+shapely>=2.0.0                 # offset del margen de costura - Fase 5

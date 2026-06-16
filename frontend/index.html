@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FlatWrap · 3D → Patrón 2D</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <!-- Visor 3D a pantalla completa -->
+  <div id="viewport"></div>
+
+  <!-- Barra de vistas de cámara -->
+  <div class="viewbar">
+    <button class="btn ghost" data-view="iso" title="Vista isométrica (5)">Iso</button>
+    <button class="btn ghost" data-view="front" title="Frente (1)">Frente</button>
+    <button class="btn ghost" data-view="side" title="Lado (3)">Lado</button>
+    <button class="btn ghost" data-view="top" title="Planta (7)">Planta</button>
+    <button class="btn ghost" id="btnFit" title="Encuadrar pieza (F)">⛶ Encuadrar</button>
+    <button class="btn ghost" id="btnUpAxis" title="Cambiar eje vertical">Z ↑</button>
+  </div>
+
+  <!-- Ayuda de controles -->
+  <div class="hints">
+    arrastrar = orbitar · botón derecho = paneo · rueda = zoom al cursor<br>
+    doble clic = centrar pivote · F = encuadrar · Esc = salir de modo
+  </div>
+
+  <!-- Panel lateral (glass) -->
+  <aside class="panel">
+    <h1>FlatWrap</h1>
+    <p class="subtitle">Patrones 2D para Premium Wrapping</p>
+
+    <section>
+      <h2>1 · Malla</h2>
+      <label class="btn" for="fileInput">Cargar STL / STEP / OBJ</label>
+      <input type="file" id="fileInput" accept=".stl,.step,.stp,.obj,.ply,.glb,.gltf,.3mf,.off" hidden>
+      <button class="btn ghost" id="btnSubdivide" title="Refina la malla (4x triángulos) para suavizar el aplanado. Reinicia la selección.">⊞ Refinar malla</button>
+      <div id="meshInfo" class="info"></div>
+    </section>
+
+    <section>
+      <h2>2 · Costuras <span class="tag">opcional · primero</span></h2>
+      <button class="btn" id="btnSeamMode">✚ Crear costura</button>
+      <div class="brush-row">
+        <button class="btn ghost" id="btnFinishSeam" disabled>✓ Terminar</button>
+        <button class="btn ghost" id="btnCancelSeam" disabled>✕ Cancelar</button>
+        <button class="btn ghost" id="btnCloseSeam" disabled>↻ Cerrar loop</button>
+      </div>
+      <div class="field">
+        <label for="inpPointSize">Tamaño de punto <span id="pointValue">2 mm</span></label>
+        <input type="range" id="inpPointSize" min="0.5" max="20" value="2" step="0.5">
+      </div>
+      <div class="info">Marca aquí las divisiones de la pieza. Al seleccionar la
+Cara A, el relleno respeta las costuras como bordes (cada clic toma una sola
+pieza). También puedes marcarlas después y volver a generar. Ctrl+Z deshace.</div>
+      <ul id="seamList" class="seam-list"></ul>
+    </section>
+
+    <section>
+      <h2>3 · Cara A <span class="tag">patrón primario</span></h2>
+      <button class="btn" id="btnSelectFace">⊕ Seleccionar cara A</button>
+      <div class="field">
+        <label for="inpAngle">Ángulo de borde <span id="angleValue">35°</span></label>
+        <input type="range" id="inpAngle" min="10" max="80" value="35" step="1">
+      </div>
+      <div class="field">
+        <label for="inpSide" title="No cruza a caras que miran a más de este ángulo del clic: frena en el canto/reverso aunque sea un filete suave. 180 = sin filtro.">No cruzar reverso <span id="sideValue">85°</span></label>
+        <input type="range" id="inpSide" min="30" max="180" value="85" step="5">
+      </div>
+      <div class="brush-row">
+        <button class="btn ghost" id="btnBrushAdd" title="Pincel: agregar caras">🖌 +</button>
+        <button class="btn ghost" id="btnBrushRemove" title="Pincel: quitar caras">🖌 −</button>
+        <button class="btn ghost" id="btnSelectAll" title="Seleccionar toda la malla">Todo</button>
+        <button class="btn ghost" id="btnClearSel" title="Limpiar selección">Limpiar</button>
+      </div>
+      <div class="field">
+        <label for="inpBrush">Radio del pincel <span id="brushValue">6 mm</span></label>
+        <input type="range" id="inpBrush" min="1" max="60" value="6" step="1">
+      </div>
+      <div class="brush-row">
+        <button class="btn ghost active" id="btnBrushCircle" title="Pincel círculo: solo la superficie del clic (no atraviesa el espesor)">○ Círculo</button>
+        <button class="btn ghost" id="btnBrushSphere" title="Pincel esfera: todo el volumen, atraviesa el espesor">● Esfera</button>
+      </div>
+      <div id="selectionInfo" class="info"></div>
+    </section>
+
+    <section>
+      <h2>4 · Patrones</h2>
+      <div class="brush-row">
+        <button class="btn ghost active" id="btnMethodRelax" title="Aplanado por minimización de energía (SLIM, símil ExactFlat): patrón CONTINUO, reparte la tensión/compresión sin rasgar. Requiere que la pieza sea un disco (si envuelve o tiene huecos, pide una costura / limpiar la Cara A).">Relajado</button>
+        <button class="btn ghost" id="btnMethodUnfold" title="Despliega cada cara sobre su pliegue (papercraft): tamaño real exacto, pero RASGA en doble curvatura (libera la curvatura como cortes).">Desplegado</button>
+        <button class="btn ghost" id="btnMethodProject" title="Sombra ortogonal sobre el plano: coincide con la vista, subestima zonas curvas">Proyección</button>
+      </div>
+      <button class="btn" id="btnGenerate">Generar patrón(es)</button>
+      <label class="check"><input type="checkbox" id="chkHeatmap" checked> Mapa de tensión</label>
+      <div class="info">Genera el/los patrón(es) de la Cara A, ya divididos por
+las costuras que hayas marcado.</div>
+      <div id="segmentInfo" class="info"></div>
+      <ul id="patchList" class="seam-list"></ul>
+    </section>
+
+    <section>
+      <h2>5 · Exportar</h2>
+      <div class="field">
+        <label for="inpAllowance">Margen de costura (mm)</label>
+        <input type="number" id="inpAllowance" value="10" min="0" max="50" step="1">
+      </div>
+      <label class="check"><input type="checkbox" id="chkNotches" checked> Muescas de alineación</label>
+      <div class="field">
+        <label for="inpNotchSpacing">Separación de muescas (mm)</label>
+        <input type="number" id="inpNotchSpacing" value="50" min="10" max="500" step="10">
+      </div>
+      <button class="btn" id="btnExport">DXF 1:1</button>
+    </section>
+
+    <div id="status" class="status"></div>
+  </aside>
+
+  <!-- Vista del patrón 2D (se abre al generar) -->
+  <div id="pattern2d" class="pattern2d hidden">
+    <button class="btn ghost close" id="btnClose2d">✕</button>
+    <canvas id="patternCanvas"></canvas>
+  </div>
+
+  <!-- Three.js r128 (no-modules, simple de servir localmente) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/STLLoader.js"></script>
+
+  <script src="js/api.js?v=16"></script>
+  <script src="js/viewer.js?v=16"></script>
+  <script src="js/selection.js?v=16"></script>
+  <script src="js/seams.js?v=16"></script>
+  <script src="js/pattern2d.js?v=16"></script>
+  <script src="js/main.js?v=16"></script>
+</body>
+</html>
