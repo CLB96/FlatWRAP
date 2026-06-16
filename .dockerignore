@@ -1,0 +1,12 @@
+# No copiar a la imagen: entorno local, caches, muestras grandes, tests.
+backend/venv/
+**/__pycache__/
+**/*.pyc
+.git/
+.claude/
+samples/
+backend/tests/
+*.dxf
+*.stl
+*.stp
+*.step
