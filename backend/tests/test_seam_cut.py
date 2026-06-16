@@ -54,30 +54,27 @@ def test_imprint_splits_triangles_along_line():
     assert len(res["face_source"]) == len(F2)
 
 
-@pytest.mark.xfail(
-    reason="LIMITACIÓN CONOCIDA: el caminado recto heurístico (apuntar al "
-    "destino proyectado por cara) se desvía en superficies curvas. El camino "
-    "recto exacto sobre una superficie curva es el problema de las geodésicas; "
-    "falta un walk con transporte paralelo (unfolding) o una geodésica robusta "
-    "a no-manifold. Ver memoria MEJORA-15.",
-    strict=False,
-)
-def test_imprint_on_curved_mesh_preserves_area():
-    # En una superficie CURVA (semicilindro) el camino recto va sobre la malla
-    # (no por un chord 3D). Debe imprimir sin colapsar: área conservada, sin
-    # caras degeneradas, aristas de corte encadenadas.
+def test_imprint_geodesic_on_curved_mesh_preserves_area():
+    # En una superficie CURVA (semicilindro) la geodésica exacta de pp3d da el
+    # camino sobre la malla; imprint_geodesic parte los triángulos conservando
+    # el área, sin caras degeneradas. (El walk heurístico falla aquí; pp3d no.)
+    import potpourri3d as pp3d
     from samples.make_samples import half_cylinder
 
     mesh = half_cylinder(50.0, 200.0)
     V = np.asarray(mesh.vertices)
     va = int(np.argmin(V[:, 0] + V[:, 1]))
     vb = int(np.argmax(V[:, 0] + V[:, 1]))
-    res = seam_cut.imprint_seam(mesh, [va, vb])
-    assert res is not None, "el caminado recto debería resolver el semicilindro"
+    solver = pp3d.EdgeFlipGeodesicSolver(
+        np.asarray(mesh.vertices, np.float64), np.asarray(mesh.faces, np.int64)
+    )
+    path = np.asarray(solver.find_geodesic_path(v_start=va, v_end=vb))
+
+    res = seam_cut.imprint_geodesic(mesh, [va, vb], [path])
+    assert res is not None, "imprint_geodesic debería resolver el semicilindro"
 
     V2, F2, cuts = res["vertices"], res["faces"], res["cut_edges"]
     assert _area(V2, F2) == pytest.approx(_area(mesh.vertices, mesh.faces), rel=1e-4)
-    # sin triángulos degenerados (área ~0)
     areas = trimesh.Trimesh(vertices=V2, faces=F2, process=False).area_faces
-    assert (areas > 1e-9).all()
+    assert (areas > 1e-9).all()              # sin triángulos degenerados
     assert len(cuts) >= 2

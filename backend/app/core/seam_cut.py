@@ -197,7 +197,15 @@ def imprint_seam(mesh, waypoints):
         seg = _walk_straight(mesh, a, b, eneigh, vfaces)
         if seg is None:
             return None
-        corridor.extend(seg if not corridor else seg)
+        corridor.extend(seg)
+    return _imprint_from_corridor(mesh, corridor)
+
+
+def _imprint_from_corridor(mesh, corridor):
+    """Construye la malla refinada a partir del corredor (cara, entrada, salida).
+
+    Devuelve {vertices, faces, cut_edges, face_source} o None.
+    """
     if not corridor:
         return None
     # Cara repetida en todo el corredor: no soportado (slivers/cruces) -> fallback
@@ -240,3 +248,84 @@ def imprint_seam(mesh, waypoints):
         "cut_edges": cut_edges,
         "face_source": np.asarray(face_source, dtype=np.int64),
     }
+
+
+# --------------------------------------------------- corredor desde geodésica
+def _edge_of_point_in_face(mesh, face, P, tol):
+    """Localiza P en un triángulo: ('vertex',id), ('edge',(a,b),P) o None."""
+    V = np.asarray(mesh.vertices)
+    tri = [int(x) for x in mesh.faces[face]]
+    for v in tri:
+        if np.linalg.norm(V[v] - P) <= tol:
+            return ("vertex", v)
+    best, bestd = None, tol
+    for a, b in ((tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])):
+        e = V[b] - V[a]
+        L2 = float(e @ e)
+        if L2 < 1e-18:
+            continue
+        t = float((P - V[a]) @ e) / L2
+        if -1e-6 <= t <= 1 + 1e-6:
+            d = np.linalg.norm(P - (V[a] + min(1.0, max(0.0, t)) * e))
+            if d <= bestd:
+                bestd, best = d, ("edge", (a, b), P)
+    return best
+
+
+def _corridor_segment(mesh, v_start, v_end, pts, eneigh, vfaces, tol):
+    """Corredor de una geodésica (pts: 3D, extremos en vértices, interiores en
+    aristas). Camina cara a cara guiado por los puntos. None si no encaja."""
+    if len(pts) < 2:
+        return None
+    # Cara inicial: incidente a v_start que contiene el 2º punto en una arista
+    p1 = pts[1]
+    start = None
+    for f in vfaces[v_start]:
+        if v_start not in [int(x) for x in mesh.faces[f]]:
+            continue
+        loc = _edge_of_point_in_face(mesh, f, p1, tol)
+        if loc is not None:
+            start = f
+            break
+    if start is None:
+        return None
+
+    corridor = []
+    face = start
+    entry = ("vertex", int(v_start))
+    for j in range(1, len(pts)):
+        if j == len(pts) - 1:
+            corridor.append((face, entry, ("vertex", int(v_end))))
+            break
+        loc = _edge_of_point_in_face(mesh, face, pts[j], tol)
+        if loc is None or loc[0] != "edge":
+            return None
+        corridor.append((face, entry, loc))
+        key = (min(loc[1]), max(loc[1]))
+        nb = [g for g in eneigh[key] if g != face]
+        if not nb:
+            return None
+        entry, face = loc, nb[0]
+    return corridor
+
+
+def imprint_geodesic(mesh, waypoints, geodesic_paths):
+    """Imprime las geodésicas exactas (una por tramo entre waypoints).
+
+    `geodesic_paths[i]` = puntos 3D de la geodésica del waypoint i al i+1
+    (de pp3d). Más robusto que el caminado heurístico: pp3d ya da los cruces.
+    Devuelve {vertices, faces, cut_edges, face_source} o None (fallback).
+    """
+    wp = [int(w) for w in waypoints]
+    if len(wp) < 2 or len(geodesic_paths) != len(wp) - 1:
+        return None
+    tol = float(np.linalg.norm(mesh.extents)) * 1e-4 + 1e-6
+    eneigh = _edge_neighbors(mesh)
+    vfaces = _vertex_faces(mesh)
+    corridor = []
+    for (a, b), pts in zip(zip(wp, wp[1:]), geodesic_paths):
+        seg = _corridor_segment(mesh, a, b, np.asarray(pts, float), eneigh, vfaces, tol)
+        if seg is None:
+            return None
+        corridor.extend(seg)
+    return _imprint_from_corridor(mesh, corridor)
