@@ -25,35 +25,68 @@ class SeamError(Exception):
 
 # Caches indexados por versión de malla (no por id(mesh): ver Session.mesh_version)
 _graph_cache: dict = {"version": None, "graph": None}
-_geo_cache: dict = {"version": None, "solver": None}
+_geo_cache: dict = {"version": None, "solver": None, "vmap": None}
+
+
+def _manifold_copy(mesh):
+    """Copia MANIFOLD (sin las caras que tocan una arista de >2 caras) + remap
+    de vértices (id original -> id en la copia, o -1 si quedó sin referenciar).
+
+    Se construye SOLO para el solver de geodésicas; la malla completa (SESSION
+    .mesh) no se toca, para no meter huecos en el aplanado.
+    """
+    from collections import Counter
+
+    V = np.asarray(mesh.vertices)
+    F = np.asarray(mesh.faces)
+    counts = Counter(map(tuple, np.sort(mesh.edges, axis=1)))
+    bad = {e for e, c in counts.items() if c > 2}
+    if bad:
+        keep = np.ones(len(F), dtype=bool)
+        for fi, (a, b, c) in enumerate(F):
+            for x, y in ((a, b), (b, c), (c, a)):
+                if (min(x, y), max(x, y)) in bad:
+                    keep[fi] = False
+                    break
+        F = F[keep]
+    used = np.unique(F)
+    remap = np.full(len(V), -1, dtype=np.int64)
+    remap[used] = np.arange(len(used))
+    return V[used], remap[F], remap
 
 
 def _geodesic_solver(mesh):
-    """Solver de geodésicas exactas (EdgeFlip), cacheado por malla. None si la
-    malla no es manifold (el solver lanza al construirse)."""
+    """Solver de geodésicas exactas (EdgeFlip) sobre una copia manifold,
+    cacheado por malla. Devuelve (solver, vmap) o (None, None)."""
     if _geo_cache["version"] == SESSION.mesh_version:
-        return _geo_cache["solver"]
+        return _geo_cache["solver"], _geo_cache["vmap"]
+    solver, vmap = None, None
     try:
+        V2, F2, remap = _manifold_copy(mesh)
         solver = pp3d.EdgeFlipGeodesicSolver(
-            np.asarray(mesh.vertices, dtype=np.float64),
-            np.asarray(mesh.faces, dtype=np.int64),
+            np.asarray(V2, dtype=np.float64), np.asarray(F2, dtype=np.int64)
         )
+        vmap = remap
     except Exception:
-        solver = None
-    _geo_cache.update(version=SESSION.mesh_version, solver=solver)
-    return solver
+        solver, vmap = None, None
+    _geo_cache.update(version=SESSION.mesh_version, solver=solver, vmap=vmap)
+    return solver, vmap
 
 
 def _geodesic_polyline(mesh, waypoints: list[int]) -> list[list[float]]:
     """Geodésica exacta que pasa por los waypoints (para DIBUJAR). Cae a la recta
-    pegada a la superficie si el solver no está disponible (malla no-manifold)."""
-    solver = _geodesic_solver(mesh)
+    pegada a la superficie si el solver no está disponible o un waypoint quedó
+    fuera de la copia manifold."""
+    solver, vmap = _geodesic_solver(mesh)
     if solver is None:
         return _straight_surface_polyline(mesh, waypoints)
     try:
+        mapped = [int(vmap[int(w)]) for w in waypoints]
+        if any(m < 0 for m in mapped):
+            return _straight_surface_polyline(mesh, waypoints)
         poly: list[list[float]] = []
-        for a, b in zip(waypoints, waypoints[1:]):
-            seg = np.asarray(solver.find_geodesic_path(v_start=int(a), v_end=int(b)))
+        for a, b in zip(mapped, mapped[1:]):
+            seg = np.asarray(solver.find_geodesic_path(v_start=a, v_end=b))
             if seg.size == 0:
                 raise ValueError("geodésica vacía")
             poly.extend(seg.tolist() if not poly else seg.tolist()[1:])
