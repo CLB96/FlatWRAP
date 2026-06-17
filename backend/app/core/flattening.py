@@ -238,6 +238,119 @@ def _count_flips(uv: np.ndarray, F: np.ndarray) -> int:
     return int((da <= 0).sum())
 
 
+def _boundary_loops_simple(F: np.ndarray) -> list[list[int]]:
+    """Lazos de borde (aristas usadas por 1 sola cara) encadenados en bucles."""
+    ec: dict = defaultdict(int)
+    for f in F:
+        for a, b in ((f[0], f[1]), (f[1], f[2]), (f[2], f[0])):
+            ec[(min(int(a), int(b)), max(int(a), int(b)))] += 1
+    adj: dict = defaultdict(list)
+    for (a, b), c in ec.items():
+        if c == 1:
+            adj[a].append(b)
+            adj[b].append(a)
+    seen: set = set()
+    loops: list = []
+    for start in list(adj):
+        if start in seen:
+            continue
+        loop = [start]
+        seen.add(start)
+        cur, prev = start, None
+        while True:
+            nxt = next((x for x in adj[cur] if x != prev and x not in seen), None)
+            if nxt is None:
+                break
+            loop.append(nxt)
+            seen.add(nxt)
+            prev, cur = cur, nxt
+        loops.append(loop)
+    return loops
+
+
+def _earclip_2d(P: np.ndarray) -> list[tuple[int, int, int]] | None:
+    """Triangula un polígono 2D simple por recorte de orejas (sin vértices
+    nuevos). Devuelve índices a P, o None si no es un polígono simple."""
+    n = len(P)
+    if n < 3:
+        return []
+    idx = list(range(n))
+    area = 0.5 * sum(
+        P[i, 0] * P[(i + 1) % n, 1] - P[(i + 1) % n, 0] * P[i, 1] for i in range(n)
+    )
+    if area < 0:
+        idx = idx[::-1]
+
+    def in_tri(p, a, b, c):
+        d = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1])
+        if abs(d) < 1e-12:
+            return False
+        u = ((b[1] - c[1]) * (p[0] - c[0]) + (c[0] - b[0]) * (p[1] - c[1])) / d
+        v = ((c[1] - a[1]) * (p[0] - c[0]) + (a[0] - c[0]) * (p[1] - c[1])) / d
+        return u >= -1e-9 and v >= -1e-9 and u + v <= 1 + 1e-9
+
+    tris: list = []
+    guard = 0
+    while len(idx) > 3 and guard < 3 * n + 10:
+        guard += 1
+        m = len(idx)
+        found = False
+        for ii in range(m):
+            i0, i1, i2 = idx[(ii - 1) % m], idx[ii], idx[(ii + 1) % m]
+            a, b, c = P[i0], P[i1], P[i2]
+            if (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]) <= 0:
+                continue  # vértice reflex
+            if any(jj not in (i0, i1, i2) and in_tri(P[jj], a, b, c) for jj in idx):
+                continue
+            tris.append((i0, i1, i2))
+            del idx[ii]
+            found = True
+            break
+        if not found:
+            return None
+    if len(idx) == 3:
+        tris.append((idx[0], idx[1], idx[2]))
+    return tris
+
+
+def _fill_inner_holes(V: np.ndarray, F: np.ndarray) -> np.ndarray:
+    """Tapa los huecos INTERIORES del parche (aberturas: agujeros, slots) SOLO
+    para el solve de SLIM, sin añadir vértices (recorte de orejas en el plano de
+    cada hueco). Devuelve F con caras extra; el llamador usa F original para la
+    salida, así las aberturas quedan en el patrón pero ya no distorsionan el
+    aplanado. Si el parche es un disco simple (≤1 borde) no hace nada.
+    """
+    loops = _boundary_loops_simple(F)
+    if len(loops) <= 1:
+        return F
+    loops.sort(key=len, reverse=True)        # el mayor = borde exterior
+    extra: list = []
+    for loop in loops[1:]:
+        if len(loop) < 3:
+            continue
+        pts = V[loop]
+        c = pts.mean(axis=0)
+        _, _, vt = np.linalg.svd(pts - c, full_matrices=False)
+        tris = _earclip_2d((pts - c) @ vt[:2].T)
+        if tris is None:
+            continue                         # hueco no simple: best-effort
+        for i, j, k in tris:
+            extra.append([loop[i], loop[j], loop[k]])
+    if not extra:
+        return F
+    F2 = np.vstack([F, np.asarray(extra, dtype=F.dtype)])
+    # Winding consistente (las orejas pueden quedar invertidas vs la superficie)
+    tmp = trimesh.Trimesh(vertices=V, faces=F2, process=False)
+    tmp.fix_normals()
+    F2 = np.asarray(tmp.faces)
+    # TODO-O-NADA: solo usar el relleno si quedó un DISCO simple (1 borde). Si
+    # algún hueco no se pudo triangular (rim muy no-plano), NO se toca el parche
+    # (se resuelve como antes) -> garantiza que nunca empeora un caso que servía.
+    if len(_boundary_loops_simple(F2)) != 1:
+        return F
+    return F2
+
+
 def _slim_uv(patch_id: int, V: np.ndarray, F: np.ndarray, areas_3d: np.ndarray) -> np.ndarray:
     """Aplanado por minimización de energía (SLIM, símil ExactFlat).
 
@@ -252,9 +365,14 @@ def _slim_uv(patch_id: int, V: np.ndarray, F: np.ndarray, areas_3d: np.ndarray) 
     queda con volteos/colapsa (malla degenerada): en esos casos sí hace falta
     una costura que abra la superficie.
     """
+    # Tapar huecos interiores (aberturas) SOLO para el solve: un parche con
+    # agujeros es multiplemente-conexo y SLIM lo contrae/pellizca. Se resuelve
+    # sobre el disco tapado; la salida usa F original (las aberturas se conservan).
+    F_solve = _fill_inner_holes(V, F)
+
     Vf = np.asfortranarray(V[:, :3].astype(np.float64))
-    Ff = np.asfortranarray(F.astype(np.int32))
-    boundary = igl.boundary_loop(F)
+    Ff = np.asfortranarray(F_solve.astype(np.int32))
+    boundary = igl.boundary_loop(F_solve)
     if boundary.size == 0:
         raise FlattenError(
             f"El parche {patch_id} es una superficie cerrada: marca una costura "
@@ -262,7 +380,7 @@ def _slim_uv(patch_id: int, V: np.ndarray, F: np.ndarray, areas_3d: np.ndarray) 
         )
 
     bnd_uv = igl.map_vertices_to_circle(Vf, boundary)
-    uv0 = _tutte_uniform_uv(V, F, boundary, bnd_uv)
+    uv0 = _tutte_uniform_uv(V, F_solve, boundary, bnd_uv)
     if not np.all(np.isfinite(uv0)):
         raise FlattenError(
             f"La inicialización del parche {patch_id} falló (malla degenerada)."
@@ -281,7 +399,7 @@ def _slim_uv(patch_id: int, V: np.ndarray, F: np.ndarray, areas_3d: np.ndarray) 
             break
         prev = uv.copy()
 
-    if _count_flips(uv, F) > 0:
+    if _count_flips(uv, F_solve) > 0:
         raise FlattenError(
             f"El parche {patch_id} no se pudo aplanar sin volteos: la superficie "
             "envuelve sobre sí misma. Agrega una costura que la ABRA y vuelve a generar."
