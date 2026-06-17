@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>FlatWrap · 3D → Patrón 2D</title>
-<link rel="stylesheet" href="css/style.css">
+<link rel="stylesheet" href="css/style.css?v=19">
 </head>
 <body>
   <!-- Visor 3D a pantalla completa -->
@@ -100,15 +100,12 @@ pieza). También puedes marcarlas después y volver a generar. Ctrl+Z deshace.</
       <button class="btn" id="btnGenerate">Generar patrón(es)</button>
       <label class="check"><input type="checkbox" id="chkHeatmap" checked> Mapa de tensión</label>
       <label class="check" title="Pinta verde lo que tu material aguanta (según la TDS) y rojo lo que lo excede. Útil para decidir cuántos patrones necesitas."><input type="checkbox" id="chkTolerance"> Modo tolerancia (material)</label>
-      <div class="field" id="tolFields" style="display:none">
-        <label>Estiramiento del material (TDS)</label>
-        <div class="brush-row">
-          <span style="font-size:.82em">warp%</span>
-          <input type="number" id="inpWarp" value="15" min="0" max="100" step="1" style="width:4em">
-          <span style="font-size:.82em">weft%</span>
-          <input type="number" id="inpWeft" value="15" min="0" max="100" step="1" style="width:4em">
-          <span style="font-size:.82em">compr%</span>
-          <input type="number" id="inpComp" value="15" min="0" max="100" step="1" style="width:4em">
+      <div id="tolFields" style="display:none;margin:6px 0">
+        <label class="tol-title">Estiramiento del material (TDS)</label>
+        <div class="tol-grid">
+          <span>Warp</span><input type="number" id="inpWarp" value="15" min="0" max="100" step="1"><span class="tol-unit">%</span>
+          <span>Weft</span><input type="number" id="inpWeft" value="15" min="0" max="100" step="1"><span class="tol-unit">%</span>
+          <span>Compresión</span><input type="number" id="inpComp" value="15" min="0" max="100" step="1"><span class="tol-unit">%</span>
         </div>
       </div>
       <div class="info">Genera el/los patrón(es) de la Cara A, ya divididos por
