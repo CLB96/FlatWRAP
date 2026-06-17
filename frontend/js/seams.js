@@ -197,12 +197,26 @@ const Seams = {
     document.getElementById('segmentInfo').textContent = '';
   },
 
+  // Marca una costura como de UNIÓN (corte recto en el DXF) o REAL (conserva
+  // la curva). Por defecto REAL: nunca pierde la geometría de diseño.
+  async setStraighten(seamId, on) {
+    (this._union ||= new Set());
+    if (on) this._union.add(seamId); else this._union.delete(seamId);
+    try { await API.setSeamStraighten(seamId, on); }
+    catch (e) { setStatus(e.message, true); }
+  },
+
   refreshList() {
     const ul = document.getElementById('seamList');
     ul.innerHTML = '';
     for (const id of this.seamObjs.keys()) {
+      const checked = (this._union && this._union.has(id)) ? 'checked' : '';
       const li = document.createElement('li');
-      li.innerHTML = `Costura #${id} <button onclick="Seams.remove(${id})">✕</button>`;
+      li.innerHTML = `Costura #${id}
+        <label class="seam-union" title="Costura de UNIÓN: su corte sale RECTO en el DXF para casar parches en AutoCAD. Sin marcar = costura REAL (conserva la curva de diseño).">
+          <input type="checkbox" ${checked} onchange="Seams.setStraighten(${id}, this.checked)"> unión (recta)
+        </label>
+        <button onclick="Seams.remove(${id})">✕</button>`;
       ul.appendChild(li);
     }
   },

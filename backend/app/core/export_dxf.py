@@ -87,6 +87,8 @@ def _seam_local_vertices(patch: dict) -> set[int]:
     """
     seam_globals: set[int] = set()
     for seam in SESSION.seams.values():
+        if not getattr(seam, "straighten", False):
+            continue   # costura REAL: conserva su curva (no se endereza)
         for a, b in seam.edge_path:
             seam_globals.add(int(a))
             seam_globals.add(int(b))

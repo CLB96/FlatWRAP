@@ -18,6 +18,10 @@ class Seam:
     edge_path: list[tuple[int, int]]  # aristas de malla que recorre la geodésica
     polyline: list[list[float]]    # puntos 3D para dibujar en el visor
     closed: bool = False
+    # Costura de UNIÓN: su corte se endereza a una recta en el DXF (los dos
+    # parches casan plano en AutoCAD). False (por defecto) = costura REAL: se
+    # conserva la curva que marcó el usuario (parte del diseño del producto).
+    straighten: bool = False
 
 
 @dataclass
@@ -72,6 +76,7 @@ class Session:
                 "seam_id": s.seam_id,
                 "polyline": s.polyline,
                 "closed": s.closed,
+                "straighten": s.straighten,
             }
             for s in self.seams.values()
         ]

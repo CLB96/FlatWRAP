@@ -99,6 +99,16 @@ def list_seams():
     return SESSION.seams_payload()
 
 
+@router.post("/seams/{seam_id}/straighten")
+def set_seam_straighten(seam_id: int, straighten: bool = True):
+    """Marca una costura como de UNIÓN (recta en el DXF) o REAL (conserva curva)."""
+    seam = SESSION.seams.get(seam_id)
+    if seam is None:
+        raise HTTPException(status_code=404, detail="Costura no encontrada")
+    seam.straighten = straighten
+    return {"seam_id": seam_id, "straighten": seam.straighten}
+
+
 # ------------------------------------------------- Fase 2.5: Cara A
 @router.post("/selection/flood")
 def selection_flood(req: FloodRequest):

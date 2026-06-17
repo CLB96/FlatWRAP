@@ -40,6 +40,15 @@ const API = {
     await fetch(`${this.base}/seams/${id}`, { method: 'DELETE' });
   },
 
+  async setSeamStraighten(id, straighten) {
+    const r = await fetch(
+      `${this.base}/seams/${id}/straighten?straighten=${straighten}`,
+      { method: 'POST' }
+    );
+    if (!r.ok) throw new Error((await r.json()).detail);
+    return r.json();
+  },
+
   async floodSelect(faceId, angleDeg, sideDeg = 85) {
     const r = await fetch(`${this.base}/selection/flood`, {
       method: 'POST',

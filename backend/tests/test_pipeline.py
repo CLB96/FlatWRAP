@@ -431,11 +431,16 @@ def test_straighten_seam_run_collapses_interior():
     assert export_dxf._straighten_seam_run([0, 1, 2, 3], set()) == [0, 1, 2, 3]
 
 
-def test_export_straightens_seam_boundary(cylinder_session):
-    # Camino B: en un parche dividido por costura, el borde de costura se
-    # endereza -> el contorno tiene MENOS puntos (se quitan los interiores).
+def test_export_straightens_only_union_seams(cylinder_session):
+    # Camino B por costura: una costura de UNIÓN (straighten=True) endereza su
+    # borde -> el contorno pierde puntos. Una costura REAL (default) NO se toca.
     a, b = _edge_boundary_vertices(SESSION.mesh)
-    geodesics.create_seam([a, b])
+    sid = geodesics.create_seam([a, b])["seam_id"]
+    # Por defecto es REAL: no endereza nada.
+    assert export_dxf._seam_local_vertices(
+        {"orig_vertex_ids": np.arange(len(SESSION.mesh.vertices))}
+    ) == set()
+    SESSION.seams[sid].straighten = True   # marcarla como UNIÓN
     segmentation.segment_by_seams(_all_faces())
     flattening.flatten_all_patches(method="relax")
     p = SESSION.patches[0]
