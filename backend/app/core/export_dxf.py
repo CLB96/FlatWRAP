@@ -79,11 +79,59 @@ def _boundary_loops(faces: np.ndarray) -> list[list[int]]:
     return loops
 
 
-def _patch_polygon(uv: np.ndarray, faces: np.ndarray) -> tuple[Polygon, list]:
-    """Polígono shapely (exterior + agujeros) del parche en UV."""
+def _seam_local_vertices(patch: dict) -> set[int]:
+    """Vértices LOCALES del parche que están sobre alguna costura.
+
+    El borde del parche a lo largo de una costura está formado por estos
+    vértices; sirve para enderezar ese tramo a una recta (Camino B).
+    """
+    seam_globals: set[int] = set()
+    for seam in SESSION.seams.values():
+        for a, b in seam.edge_path:
+            seam_globals.add(int(a))
+            seam_globals.add(int(b))
+    if not seam_globals:
+        return set()
+    g2l = {int(g): i for i, g in enumerate(np.asarray(patch["orig_vertex_ids"]))}
+    return {g2l[g] for g in seam_globals if g in g2l}
+
+
+def _straighten_seam_run(loop: list[int], seam_local: set[int]) -> list[int]:
+    """Colapsa cada tramo de costura del borde a una RECTA: quita los vértices
+    de costura INTERIORES (ambos vecinos también costura), dejando solo los
+    extremos del tramo. Así el contorno va derecho de un extremo al otro de la
+    costura, sin importar por dónde zigzaguean los triángulos.
+    """
+    n = len(loop)
+    if n < 3 or not any(v in seam_local for v in loop):
+        return loop
+    keep = []
+    for i in range(n):
+        v = loop[i]
+        if v not in seam_local:
+            keep.append(v)
+            continue
+        prev_s = loop[(i - 1) % n] in seam_local
+        next_s = loop[(i + 1) % n] in seam_local
+        if not (prev_s and next_s):   # extremo de tramo: conservar
+            keep.append(v)
+    return keep if len(keep) >= 3 else loop
+
+
+def _patch_polygon(
+    uv: np.ndarray, faces: np.ndarray, seam_local: set[int] | None = None
+) -> tuple[Polygon, list]:
+    """Polígono shapely (exterior + agujeros) del parche en UV.
+
+    Si se pasa `seam_local`, los tramos de costura del borde se enderezan a
+    rectas (para que dos parches vecinos casen limpios en AutoCAD).
+    """
     loops = _boundary_loops(faces)
     if not loops:
         raise ExportError("Un parche no tiene borde: no se puede exportar")
+    if seam_local:
+        loops = [_straighten_seam_run(loop, seam_local) for loop in loops]
+        loops = [loop for loop in loops if len(loop) >= 3]
     rings = [uv[loop] for loop in loops]
     rings.sort(key=lambda r: -abs(Polygon(r).area))
     polygon = Polygon(rings[0], [r for r in rings[1:]])
@@ -177,7 +225,13 @@ def _draw_patch(msp, pid, patch, seam_allowance_mm, add_notches, notch_spacing_m
     # faces_2d indexa a uv (en 'unfold' el net duplica vértices en los cortes;
     # en project/arap es la malla original). Fallback a la malla por si acaso.
     faces = np.asarray(patch.get("faces_2d", patch["mesh"].faces))
-    polygon, rings = _patch_polygon(uv, faces)
+    # Enderezar la costura (Camino B) solo cuando el UV está indexado por vértice
+    # original (relax/project): ahí el borde local mapea 1:1 a la malla. En
+    # 'unfold' el net reindexa, así que no se endereza (no aplica).
+    seam_local = None
+    if len(uv) == len(np.asarray(patch["mesh"].vertices)):
+        seam_local = _seam_local_vertices(patch)
+    polygon, rings = _patch_polygon(uv, faces, seam_local)
 
     # Línea de costura neta (discontinua)
     for ring in rings:

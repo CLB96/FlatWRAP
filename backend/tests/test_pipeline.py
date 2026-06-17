@@ -422,6 +422,32 @@ def test_boundary_loops_terminate_on_nonmanifold():
     assert total <= 8  # no revisita aristas infinitamente
 
 
+def test_straighten_seam_run_collapses_interior():
+    # El tramo de costura (vértices 2,3,4) se colapsa a recta: se quita el
+    # interior (3), se conservan extremos (2,4) y el contorno libre (0,1,5).
+    out = export_dxf._straighten_seam_run([0, 1, 2, 3, 4, 5], {2, 3, 4})
+    assert out == [0, 1, 2, 4, 5]
+    # Sin costura, el borde no cambia.
+    assert export_dxf._straighten_seam_run([0, 1, 2, 3], set()) == [0, 1, 2, 3]
+
+
+def test_export_straightens_seam_boundary(cylinder_session):
+    # Camino B: en un parche dividido por costura, el borde de costura se
+    # endereza -> el contorno tiene MENOS puntos (se quitan los interiores).
+    a, b = _edge_boundary_vertices(SESSION.mesh)
+    geodesics.create_seam([a, b])
+    segmentation.segment_by_seams(_all_faces())
+    flattening.flatten_all_patches(method="relax")
+    p = SESSION.patches[0]
+    faces = np.asarray(p.get("faces_2d", p["mesh"].faces))
+    loops = export_dxf._boundary_loops(faces)
+    seam_local = export_dxf._seam_local_vertices(p)
+    assert seam_local                                   # el parche toca la costura
+    before = sum(len(loop) for loop in loops)
+    after = sum(len(export_dxf._straighten_seam_run(loop, seam_local)) for loop in loops)
+    assert after < before                               # se enderezó (menos puntos)
+
+
 def test_export_dxf_layers_and_scale(cylinder_session, tmp_path, monkeypatch):
     monkeypatch.setattr(export_dxf, "OUTPUT_DIR", tmp_path)
     a, b = _edge_boundary_vertices(SESSION.mesh)
