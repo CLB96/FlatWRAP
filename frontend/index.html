@@ -36,6 +36,11 @@
       <label class="btn" for="fileInput">Cargar STL / STEP / OBJ</label>
       <input type="file" id="fileInput" accept=".stl,.step,.stp,.obj,.ply,.glb,.gltf,.3mf,.off" hidden>
       <button class="btn ghost" id="btnSubdivide" title="Refina la malla (4x triángulos) para suavizar el aplanado. Reinicia la selección.">⊞ Refinar malla</button>
+      <label class="check" title="Resalta los cantos donde cambia el ángulo (dónde acaba una curva y empieza una recta). Útil con la luz pareja sin sombras."><input type="checkbox" id="chkEdges" checked> Aristas (cambios de ángulo)</label>
+      <div class="field">
+        <label for="inpEdgeAngle">Sensibilidad de canto <span id="edgeAngleValue">22°</span></label>
+        <input type="range" id="inpEdgeAngle" min="8" max="60" value="22" step="1">
+      </div>
       <div id="meshInfo" class="info"></div>
     </section>
 
@@ -128,11 +133,11 @@ las costuras que hayas marcado.</div>
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/STLLoader.js"></script>
 
-  <script src="js/api.js?v=17"></script>
-  <script src="js/viewer.js?v=17"></script>
-  <script src="js/selection.js?v=17"></script>
-  <script src="js/seams.js?v=17"></script>
-  <script src="js/pattern2d.js?v=17"></script>
-  <script src="js/main.js?v=17"></script>
+  <script src="js/api.js?v=18"></script>
+  <script src="js/viewer.js?v=18"></script>
+  <script src="js/selection.js?v=18"></script>
+  <script src="js/seams.js?v=18"></script>
+  <script src="js/pattern2d.js?v=18"></script>
+  <script src="js/main.js?v=18"></script>
 </body>
 </html>

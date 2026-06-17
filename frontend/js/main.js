@@ -238,6 +238,14 @@ window.addEventListener('DOMContentLoaded', () => {
       setStatus('Malla refinada ✓ · vuelve a seleccionar la Cara A');
     } catch (err) { setStatus(err.message, true); }
   });
+  document.getElementById('chkEdges').addEventListener('change', (e) =>
+    Viewer.setEdgesVisible(e.target.checked));
+  const edgeAngle = document.getElementById('inpEdgeAngle');
+  edgeAngle.addEventListener('input', (e) => {
+    const deg = parseInt(e.target.value, 10);
+    document.getElementById('edgeAngleValue').textContent = `${deg}°`;
+    Viewer.setEdgeThreshold(deg);
+  });
   document.getElementById('chkHeatmap').addEventListener('change', () => Pattern2D.render());
   document.getElementById('btnClose2d').addEventListener('click', () => Pattern2D.hide());
   addEventListener('resize', () => {

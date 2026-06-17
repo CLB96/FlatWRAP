@@ -216,8 +216,40 @@ const Viewer = {
     this.clearOverlay();
     this.hideBrushCursor();
     this._computeCentroids();
+    this._buildFeatureEdges();
     this._rebuildHelpers();
     this.setView('iso');
+  },
+
+  // Aristas donde CAMBIA el ángulo (cantos/creases): con luz pareja sin sombras,
+  // marcan dónde acaba una curva y empieza una recta. EdgesGeometry solo dibuja
+  // las aristas cuyo ángulo diédrico supera el umbral (la superficie lisa no).
+  _buildFeatureEdges() {
+    if (this.featureEdges) {
+      this.scene.remove(this.featureEdges);
+      this.featureEdges.geometry.dispose();
+      this.featureEdges = null;
+    }
+    if (!this.mesh) return;
+    const thr = this.edgeThresholdDeg ?? 22;
+    const eg = new THREE.EdgesGeometry(this.mesh.geometry, thr);
+    const lmat = new THREE.LineBasicMaterial({
+      color: 0x0c1622, transparent: true, opacity: 0.6,
+    });
+    this.featureEdges = new THREE.LineSegments(eg, lmat);
+    this.featureEdges.visible = this._edgesOn !== false;
+    this.featureEdges.renderOrder = 1;
+    this.scene.add(this.featureEdges);
+  },
+
+  setEdgesVisible(on) {
+    this._edgesOn = on;
+    if (this.featureEdges) this.featureEdges.visible = on;
+  },
+
+  setEdgeThreshold(deg) {
+    this.edgeThresholdDeg = deg;
+    this._buildFeatureEdges();
   },
 
   // Centroide y normal de cada cara, precalculados para el pincel
