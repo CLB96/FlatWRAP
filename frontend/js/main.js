@@ -247,6 +247,20 @@ window.addEventListener('DOMContentLoaded', () => {
     Viewer.setEdgeThreshold(deg);
   });
   document.getElementById('chkHeatmap').addEventListener('change', () => Pattern2D.render());
+  const tolFields = document.getElementById('tolFields');
+  const syncTol = () => {
+    Pattern2D.tolerance.warp = parseFloat(document.getElementById('inpWarp').value) || 0;
+    Pattern2D.tolerance.weft = parseFloat(document.getElementById('inpWeft').value) || 0;
+    Pattern2D.tolerance.comp = parseFloat(document.getElementById('inpComp').value) || 0;
+    Pattern2D.render();
+  };
+  document.getElementById('chkTolerance').addEventListener('change', (e) => {
+    Pattern2D.tolerance.on = e.target.checked;
+    tolFields.style.display = e.target.checked ? '' : 'none';
+    syncTol();
+  });
+  ['inpWarp', 'inpWeft', 'inpComp'].forEach((id) =>
+    document.getElementById(id).addEventListener('input', syncTol));
   document.getElementById('btnClose2d').addEventListener('click', () => Pattern2D.hide());
   addEventListener('resize', () => {
     if (!document.getElementById('pattern2d').classList.contains('hidden')) {

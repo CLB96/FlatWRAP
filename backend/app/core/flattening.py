@@ -634,6 +634,10 @@ def flatten_patch(patch_id: int, method: str = "unfold") -> dict:
         "uv": uv.tolist(),
         "faces": faces_2d.tolist(),
         "strain": np.round(strain, 1).tolist(),
+        # Estiramientos principales por cara (σ1≥σ2) para el modo TOLERANCIA:
+        # el frontend compara contra los límites warp/weft/compresión de la TDS.
+        "s1": np.round(s1, 3).tolist(),
+        "s2": np.round(s2, 3).tolist(),
         "distortion": distortion.tolist(),
         "mean_distortion_pct": round(mean_pct, 2),
         "max_distortion_pct": round(float(deviation.max() * 100.0), 2),

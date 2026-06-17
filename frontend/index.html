@@ -99,6 +99,18 @@ pieza). También puedes marcarlas después y volver a generar. Ctrl+Z deshace.</
       </div>
       <button class="btn" id="btnGenerate">Generar patrón(es)</button>
       <label class="check"><input type="checkbox" id="chkHeatmap" checked> Mapa de tensión</label>
+      <label class="check" title="Pinta verde lo que tu material aguanta (según la TDS) y rojo lo que lo excede. Útil para decidir cuántos patrones necesitas."><input type="checkbox" id="chkTolerance"> Modo tolerancia (material)</label>
+      <div class="field" id="tolFields" style="display:none">
+        <label>Estiramiento del material (TDS)</label>
+        <div class="brush-row">
+          <span style="font-size:.82em">warp%</span>
+          <input type="number" id="inpWarp" value="15" min="0" max="100" step="1" style="width:4em">
+          <span style="font-size:.82em">weft%</span>
+          <input type="number" id="inpWeft" value="15" min="0" max="100" step="1" style="width:4em">
+          <span style="font-size:.82em">compr%</span>
+          <input type="number" id="inpComp" value="15" min="0" max="100" step="1" style="width:4em">
+        </div>
+      </div>
       <div class="info">Genera el/los patrón(es) de la Cara A, ya divididos por
 las costuras que hayas marcado.</div>
       <div id="segmentInfo" class="info"></div>
@@ -133,11 +145,11 @@ las costuras que hayas marcado.</div>
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/STLLoader.js"></script>
 
-  <script src="js/api.js?v=18"></script>
-  <script src="js/viewer.js?v=18"></script>
-  <script src="js/selection.js?v=18"></script>
-  <script src="js/seams.js?v=18"></script>
-  <script src="js/pattern2d.js?v=18"></script>
-  <script src="js/main.js?v=18"></script>
+  <script src="js/api.js?v=19"></script>
+  <script src="js/viewer.js?v=19"></script>
+  <script src="js/selection.js?v=19"></script>
+  <script src="js/seams.js?v=19"></script>
+  <script src="js/pattern2d.js?v=19"></script>
+  <script src="js/main.js?v=19"></script>
 </body>
 </html>

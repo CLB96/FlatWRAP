@@ -1,6 +1,8 @@
 // pattern2d.js - render del patrón aplanado en canvas 2D (Fases 4/5)
 const Pattern2D = {
   lastPatches: null,   // para re-render al togglear el heatmap
+  // Modo tolerancia: pinta verde/rojo según los límites de la TDS del material.
+  tolerance: { on: false, warp: 15, weft: 15, comp: 15 },
 
   show(patches) {
     this.lastPatches = patches;
@@ -11,7 +13,9 @@ const Pattern2D = {
   render() {
     const patches = this.lastPatches;
     if (!patches) return;
-    const heatmap = document.getElementById('chkHeatmap').checked;
+    const tol = this.tolerance;
+    const tolMode = tol.on && patches[0] && patches[0].s1;
+    const heatmap = !tolMode && document.getElementById('chkHeatmap').checked;
     const canvas = document.getElementById('patternCanvas');
     canvas.width = canvas.clientWidth * devicePixelRatio;
     canvas.height = canvas.clientHeight * devicePixelRatio;
@@ -33,7 +37,23 @@ const Pattern2D = {
     const ty = y => canvas.height - pad - (y - minY) * s;
 
     for (const p of patches) {
-      if (heatmap) {
+      if (tolMode) {
+        // Modo TOLERANCIA: verde = dentro del material (TDS), rojo = lo excede.
+        let okCount = 0;
+        for (let f = 0; f < p.faces.length; f++) {
+          const [a, b, c] = p.faces[f];
+          const pass = this._facePass(p.s1[f], p.s2[f], tol);
+          if (pass) okCount++;
+          ctx.fillStyle = pass ? 'rgba(46,204,113,0.85)' : 'rgba(231,76,60,0.9)';
+          ctx.beginPath();
+          ctx.moveTo(tx(p.uv[a][0]), ty(p.uv[a][1]));
+          ctx.lineTo(tx(p.uv[b][0]), ty(p.uv[b][1]));
+          ctx.lineTo(tx(p.uv[c][0]), ty(p.uv[c][1]));
+          ctx.closePath();
+          ctx.fill();
+        }
+        p._okPct = Math.round(100 * okCount / p.faces.length);
+      } else if (heatmap) {
         // Mapa de tensión por triángulo: azul = compresión, rojo = tensión
         const strain = p.strain || p.distortion.map(d => (d - 1) * 100);
         for (let f = 0; f < p.faces.length; f++) {
@@ -62,9 +82,11 @@ const Pattern2D = {
       // Etiqueta compacta sobre cada patrón (evita solape cuando hay varios)
       const cx = p.uv.reduce((acc, q) => acc + q[0], 0) / p.uv.length;
       const yTop = Math.max(...p.uv.map(q => q[1]));
-      const metric = (p.tension_pct != null)
-        ? `+${p.tension_pct}% / −${p.compression_pct}%`
-        : `${p.mean_distortion_pct}%`;
+      const metric = tolMode
+        ? `${p._okPct}% dentro de tolerancia`
+        : (p.tension_pct != null)
+          ? `+${p.tension_pct}% / −${p.compression_pct}%`
+          : `${p.mean_distortion_pct}%`;
       ctx.fillStyle = '#e6edf3';
       ctx.font = `${12 * devicePixelRatio}px Segoe UI`;
       ctx.textAlign = 'center';
@@ -75,7 +97,36 @@ const Pattern2D = {
     }
 
     this._drawScaleBar(ctx, canvas, s);
-    if (heatmap) this._drawLegend(ctx, canvas);
+    if (tolMode) this._drawTolLegend(ctx, canvas);
+    else if (heatmap) this._drawLegend(ctx, canvas);
+  },
+
+  // ¿La cara cabe en el material? Asume orientación óptima: el estiramiento
+  // mayor (σ1) va a la dirección que más tolera (max(warp,weft)); el otro (σ2)
+  // a la otra; la compresión contra su propio límite.
+  _facePass(s1, s2, tol) {
+    const hi = Math.max(tol.warp, tol.weft);
+    const lo = Math.min(tol.warp, tol.weft);
+    const tens1 = (s1 - 1) * 100, tens2 = (s2 - 1) * 100;  // σ1≥σ2
+    const okTens = Math.max(0, tens1) <= hi && Math.max(0, tens2) <= lo;
+    const okComp = Math.max(0, -tens2) <= tol.comp && Math.max(0, -tens1) <= tol.comp;
+    return okTens && okComp;
+  },
+
+  _drawTolLegend(ctx, canvas) {
+    const x = canvas.width - 220 * devicePixelRatio;
+    const y = canvas.height - 30 * devicePixelRatio;
+    const sq = 12 * devicePixelRatio;
+    ctx.font = `${11 * devicePixelRatio}px Segoe UI`;
+    ctx.textAlign = 'left';
+    ctx.fillStyle = 'rgba(46,204,113,0.9)';
+    ctx.fillRect(x, y, sq, sq);
+    ctx.fillStyle = '#8b949e';
+    ctx.fillText('dentro del material', x + sq + 6 * devicePixelRatio, y + sq);
+    ctx.fillStyle = 'rgba(231,76,60,0.95)';
+    ctx.fillRect(x + 130 * devicePixelRatio, y, sq, sq);
+    ctx.fillStyle = '#8b949e';
+    ctx.fillText('excede', x + 130 * devicePixelRatio + sq + 6 * devicePixelRatio, y + sq);
   },
 
   // Mapa divergente: azul = compresión, gris = neutro, rojo = tensión.
