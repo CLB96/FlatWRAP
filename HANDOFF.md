@@ -1,60 +1,42 @@
 # FlatWrap — Handoff para continuar
 
 > App 3D→patrón 2D para **premium wrapping** de piezas automotrices.
-> Estado: **EN VIVO**, estable, 28 tests verdes. Este doc es para retomar en una sesión nueva.
+> Estado: **EN VIVO**, estable, 30 tests verdes. Este doc es para retomar en una sesión nueva.
 
 ---
 
 ## 🎯 TAREA INMEDIATA (lo que sigue)
 
-**Suavizar el corte de las costuras REALES (no-unión) para que sigan la curva
-geodésica dibujada, sin zigzag.**
+**HECHO (MEJORA-22): el corte de costuras REALES ya sigue la geodésica suave, sin
+zigzag.** Camino A implementado en `backend/app/core/export_dxf.py`. Lo que sigue
+ahora son los pendientes de "Otros pendientes" (auto-re-pegar parches de unión,
+`FLATWRAP_PASSWORD`, sesión-por-navegador). Detalle del fix abajo por si hay que
+ajustarlo.
 
-- **Síntoma**: una costura marcada como REAL (checkbox "unión (recta)" SIN marcar)
-  conserva su forma, pero su corte en el DXF sale **zigzagueado** (sigue las aristas
-  de la malla) en zonas donde el usuario dibujó una **curva suave**.
-- **Objetivo** (sketch del usuario = línea roja): el corte debe seguir la **línea
-  geodésica suave** que él trazó al clickear, no el zigzag de los triángulos.
-
-### Datos clave del problema
-- La costura dibujada (lo que el usuario VE y quiere) = `Seam.polyline` — puntos 3D
-  de la **geodésica exacta** (pp3d), suave. Está en `backend/app/core/session.py`.
-- El CORTE actual sigue `Seam.edge_path` — cadena de aristas de malla (Dijkstra),
-  **jagged**. La segmentación corta por ahí.
-- `Seam.straighten` (bool, default False): True = costura de UNIÓN (se endereza a
-  recta en el DXF, MEJORA-21). False = REAL (hoy queda jagged → ESTE es el problema).
-
-### Enfoques para resolverlo (recomendado: A)
-**A) Mapear la geodésica `polyline` al UV 2D del parche (la solución correcta).**
-   - Por cada punto de `Seam.polyline` (3D, sobre la superficie), hallar el triángulo
-     del parche que lo contiene y su coordenada baricéntrica → aplicar la MISMA
-     baricéntrica al UV 2D del triángulo → posición 2D suave.
-   - Reemplazar el tramo de costura jagged del contorno (en `export_dxf`) por esta
-     polilínea 2D suave (solo para costuras REALES; las de unión ya van rectas).
-   - **REUSAR `backend/app/core/seam_cut.py`**: ya tiene la infraestructura que mapea
-     cada punto de la geodésica pp3d a su triángulo/arista (`_corridor_segment`,
-     `imprint_geodesic`, `_classify_points`, `_global_point_edge`). Eso resuelve el
-     "qué triángulo contiene cada punto" sin rtree. NO está integrado (se revirtió el
-     imprint 3D porque modificar la malla era frágil), pero el mapeo punto→triángulo
-     SÍ sirve para esto (que es solo 2D, no toca la malla → mucho más robusto).
-   - Ventaja: opera en la SALIDA 2D, no en la topología → robusto (igual que Camino B).
-
-**B) Suavizar/simplificar el contorno jagged (pragmático, más simple).**
-   - Douglas–Peucker sobre el tramo de costura + conservar los waypoints clickeados
-     (`Seam.vertex_ids`). Quita el zigzag de alta frecuencia pero NO sigue la
-     geodésica exacta. Más rápido, menos fiel.
-
-### Dónde tocar (Camino A)
-- `backend/app/core/export_dxf.py`: hoy `_seam_local_vertices` + `_straighten_seam_run`
-  enderezan costuras de UNIÓN. Agregar, para costuras REALES, un reemplazo del tramo
-  de costura del contorno por la geodésica mapeada a 2D.
-- Necesitas el UV por vértice del parche (`patch["uv"]` indexado por vértice original
-  en relax/project; ver guarda `len(uv)==len(mesh.vertices)`).
-- Mapeo 3D→2D: baricéntrica del punto de `polyline` en su triángulo del parche →
-  combinar los 3 UV de ese triángulo.
-- Tests: agregar uno que verifique que el contorno de una costura REAL sigue la
-  geodésica (p.ej. distancia máx del contorno a la polilínea < umbral) y que NO se
-  endereza a recta.
+### Qué se hizo (Camino A — mapear la geodésica al UV 2D)
+- Por cada punto de `Seam.polyline` (3D, geodésica pp3d suave), se halla el triángulo
+  del parche que lo contiene (baricéntrica) y se aplica esa misma baricéntrica al UV
+  2D de ese triángulo → posición 2D suave. En `export_dxf._bary_map_point` /
+  `_map_polyline_to_uv` / `_real_seams_2d` / `_smooth_real_seam_runs`.
+- En el contorno (`_patch_polygon`) el tramo de costura REAL (jagged, por aristas) se
+  REEMPLAZA por esa polilínea 2D suave. Las de UNIÓN (`straighten=True`) se siguen
+  enderezando a recta (Camino B, intacto). Solo aplica con UV por-vértice
+  (relax/project; guarda `len(uv)==len(mesh.vertices)`; en 'unfold' no aplica).
+- **CLAVE / por qué NO se usó la restricción a caras del edge_path**: la búsqueda del
+  triángulo contenedor barre TODAS las caras del parche cercanas a la geodésica (con
+  prefiltro por bbox), NO solo las del corte por aristas. En mallas irregulares (STEP
+  real) el edge_path Dijkstra zigzaguea a escala de triángulo PERO sigue de cerca a la
+  geodésica → el mapeo cae perfecto (dev ~0). En una GRILLA axis-aligned el edge_path
+  diverge muchísimo de una diagonal (artefacto de grilla) → por eso el test usa una
+  lámina plana IRREGULAR (Delaunay), no el medio cilindro.
+- Tests nuevos (2, en `tests/test_pipeline.py`): `test_real_seam_cut_follows_geodesic_
+  not_jagged` (sigue la recta, quita el zigzag de alta frecuencia) y
+  `test_real_seam_contour_not_straightened_like_union` (conserva la curva, no la
+  colapsa a recta como la de unión). 30/30 verdes.
+- **OJO**: NO mueve físicamente el corte a la geodésica (eso requeriría re-cortar la
+  malla = el imprint 3D de `seam_cut.py`, revertido por frágil). El corte sigue en la
+  frontera del parche (edge_path); el suavizado lo "limpia" hacia la geodésica con
+  clamping al triángulo del parche. En mallas densas reales coinciden ~1 triángulo.
 
 ---
 
@@ -111,7 +93,11 @@ geodésica dibujada, sin zigzag.**
 - M19: **modo tolerancia** material (warp/weft/compresión TDS → verde/rojo). Default 15%.
 - M20: **Camino B** — costura recta en el DXF (enderezar tramo de costura).
 - M21: **straighten por-costura** (unión vs real). Endpoint `/api/seams/{id}/straighten`.
-- **→ SIGUE**: suavizar el corte de costuras REALES a la geodésica (sin zigzag). Ver arriba.
+- M22: **costura REAL = geodésica suave en el DXF** (Camino A). Mapea `Seam.polyline`
+  al UV 2D del parche por baricéntrica y reemplaza el tramo jagged del contorno. Solo
+  backend/export_dxf.py; sin cambios de frontend. 30/30 tests. Ver arriba.
+- **→ SIGUE**: pendientes menores (auto-re-pegar parches de unión, FLATWRAP_PASSWORD,
+  sesión-por-navegador). Ver "Otros pendientes".
 
 ## ⏳ Otros pendientes (menores, acordados)
 - Auto-RE-PEGAR los 2 parches de una costura de UNIÓN en UN solo patrón en el DXF

@@ -453,6 +453,100 @@ def test_export_straightens_only_union_seams(cylinder_session):
     assert after < before                               # se enderezó (menos puntos)
 
 
+def _flat_irregular_mesh(side=200.0, n_inner=1500, n_edge=41, seed=0):
+    """Lámina plana z=0 con triangulación IRREGULAR (Delaunay). Imita el teselado
+    de una pieza STEP real: a diferencia de una grilla, el camino más corto por
+    aristas (Dijkstra) sí sigue de cerca a la geodésica, zigzagueando a escala de
+    triángulo a su alrededor — justo el caso que el suavizado debe arreglar."""
+    import trimesh
+    from scipy.spatial import Delaunay
+
+    rng = np.random.default_rng(seed)
+    e = np.linspace(0, side, n_edge)
+    z, full = np.zeros_like(e), np.full_like(e, side)
+    border = np.vstack([
+        np.column_stack([e, z]), np.column_stack([e, full]),
+        np.column_stack([z, e]), np.column_stack([full, e]),
+    ])
+    pts = np.unique(np.vstack([border, rng.uniform(5, side - 5, size=(n_inner, 2))]), axis=0)
+    faces = Delaunay(pts).simplices
+    verts = np.column_stack([pts, np.zeros(len(pts))])
+    return trimesh.Trimesh(vertices=verts, faces=faces, process=True)
+
+
+def _setup_real_seam_on_flat():
+    """Carga la lámina plana, traza una costura REAL diagonal de borde a borde,
+    segmenta (2 parches) y aplana. Devuelve (patch, uv, seam_id)."""
+    mesh_io.load_mesh(_flat_irregular_mesh().export(file_type="stl"), "flat.stl")
+    v = np.asarray(SESSION.mesh.vertices)
+    a = int(np.argmin(np.linalg.norm(v[:, :2] - np.array([0.0, 60.0]), axis=1)))
+    b = int(np.argmin(np.linalg.norm(v[:, :2] - np.array([200.0, 140.0]), axis=1)))
+    sid = geodesics.create_seam([a, b])["seam_id"]
+    segmentation.segment_by_seams(list(range(len(SESSION.mesh.faces))))
+    flattening.flatten_all_patches(method="project")
+    patch = SESSION.patches[0]
+    return patch, np.asarray(patch["uv"]), sid
+
+
+def _perp_offsets(pts: np.ndarray) -> np.ndarray:
+    """Desplazamiento perpendicular de cada punto respecto a la recta extremo-
+    extremo (mide cuánto se aparta el trazo de la cuerda)."""
+    pts = np.asarray(pts, float)
+    d = pts[-1] - pts[0]
+    L = float(np.linalg.norm(d))
+    if L < 1e-9:
+        return np.zeros(len(pts))
+    d = d / L
+    rel = pts - pts[0]
+    return rel[:, 0] * (-d[1]) + rel[:, 1] * d[0]
+
+
+def test_real_seam_cut_follows_geodesic_not_jagged():
+    # Camino A: una costura REAL sobre la lámina plana irregular debe cortar
+    # siguiendo la GEODÉSICA (recta en el plano), no el zigzag de las aristas.
+    patch, uv, sid = _setup_real_seam_on_flat()
+    assert SESSION.seams[sid].straighten is False              # REAL por defecto
+    assert len(uv) == len(np.asarray(patch["mesh"].vertices))  # 1:1 por vértice
+
+    real_seams = export_dxf._real_seams_2d(patch, uv)
+    assert len(real_seams) == 1
+    poly2d = np.asarray(real_seams[0]["poly2d"])
+    assert len(poly2d) > 2                                     # NO colapsada a recta
+
+    # edge_path (jagged) mapeado al 2D, en orden, para comparar
+    seam = SESSION.seams[sid]
+    chain = list(dict.fromkeys([v for ab in seam.edge_path for v in ab]))
+    g2l = {int(g): i for i, g in enumerate(np.asarray(patch["orig_vertex_ids"]))}
+    jagged2d = uv[[g2l[v] for v in chain if v in g2l]]
+
+    smooth_dev = float(np.abs(_perp_offsets(poly2d)).max())
+    jagged_dev = float(np.abs(_perp_offsets(jagged2d)).max())
+    # Suavidad: variación total perpendicular (cuánto sube-y-baja el trazo)
+    smooth_tv = float(np.abs(np.diff(_perp_offsets(poly2d))).sum())
+    jagged_tv = float(np.abs(np.diff(_perp_offsets(jagged2d))).sum())
+
+    assert smooth_dev < 5.0                  # sigue la geodésica recta (~0)
+    assert smooth_dev < jagged_dev * 0.5     # se aparta MUCHO menos que el zigzag
+    assert smooth_tv < jagged_tv * 0.25      # el zigzag de alta frecuencia desapareció
+    SESSION.reset()
+
+
+def test_real_seam_contour_not_straightened_like_union():
+    # La costura REAL conserva su geodésica en el contorno (Camino A); la de
+    # UNIÓN colapsa ese tramo a una recta (Camino B). El contorno REAL tiene
+    # por tanto MÁS puntos en el tramo de costura que la versión enderezada.
+    patch, uv, _ = _setup_real_seam_on_flat()
+    faces = np.asarray(patch.get("faces_2d", patch["mesh"].faces))
+
+    real_seams = export_dxf._real_seams_2d(patch, uv)
+    _, rings_real = export_dxf._patch_polygon(uv, faces, set(), real_seams)
+    union_local = {v for rs in real_seams for v in rs["local"]}
+    _, rings_union = export_dxf._patch_polygon(uv, faces, union_local, [])
+
+    assert sum(len(r) for r in rings_real) > sum(len(r) for r in rings_union)
+    SESSION.reset()
+
+
 def test_export_dxf_layers_and_scale(cylinder_session, tmp_path, monkeypatch):
     monkeypatch.setattr(export_dxf, "OUTPUT_DIR", tmp_path)
     a, b = _edge_boundary_vertices(SESSION.mesh)

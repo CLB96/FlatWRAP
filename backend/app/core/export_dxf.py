@@ -120,21 +120,166 @@ def _straighten_seam_run(loop: list[int], seam_local: set[int]) -> list[int]:
     return keep if len(keep) >= 3 else loop
 
 
+# ------------------------------------- Camino A: costura REAL = geodésica suave
+def _bary_map_point(P, A, B, C, uvA, uvB, uvC):
+    """Mapea el punto 3D `P` al 2D usando coords baricéntricas en el triángulo
+    candidato que mejor lo contiene (sobre el plano y dentro del triángulo).
+
+    Vectorizado sobre los triángulos candidatos. Devuelve el punto 2D: la MISMA
+    baricéntrica de P en su triángulo 3D aplicada a los 3 UV de ese triángulo.
+    Como un punto de la geodésica vive sobre la superficie, el triángulo correcto
+    tiene distancia-al-plano ~0 y baricéntrica ≥ 0; los demás se penalizan.
+    """
+    v0, v1, ap = B - A, C - A, P - A
+    d00 = np.einsum("ij,ij->i", v0, v0)
+    d01 = np.einsum("ij,ij->i", v0, v1)
+    d11 = np.einsum("ij,ij->i", v1, v1)
+    d20 = np.einsum("ij,ij->i", ap, v0)
+    d21 = np.einsum("ij,ij->i", ap, v1)
+    denom = d00 * d11 - d01 * d01
+    denom = np.where(np.abs(denom) < 1e-18, 1e-18, denom)
+    wb = (d11 * d20 - d01 * d21) / denom        # peso del vértice B
+    wc = (d00 * d21 - d01 * d20) / denom        # peso del vértice C
+    wa = 1.0 - wb - wc                          # peso del vértice A
+    normal = np.cross(v0, v1)
+    nn = np.linalg.norm(normal, axis=1)
+    nn = np.where(nn < 1e-18, 1e-18, nn)
+    plane_dist = np.abs(np.einsum("ij,ij->i", ap, normal)) / nn
+    outside = np.maximum(0, -wa) + np.maximum(0, -wb) + np.maximum(0, -wc)
+    # outside es fracción (adimensional); a mm con una constante >> tamaño pieza
+    k = int(np.argmin(plane_dist + outside * 1e4))
+    a, b, c = max(wa[k], 0.0), max(wb[k], 0.0), max(wc[k], 0.0)
+    s = a + b + c
+    a, b, c = a / s, b / s, c / s               # s>0 siempre (suman 1)
+    return a * uvA[k] + b * uvB[k] + c * uvC[k]
+
+
+def _map_polyline_to_uv(seam, patch: dict, uv: np.ndarray):
+    """Geodésica 3D de la costura (`seam.polyline`) mapeada al UV 2D del parche.
+
+    Solo válido cuando uv está indexado por vértice local (relax/project):
+    ahí uv[v] es el 2D del vértice local v y las caras locales indexan uv.
+    Devuelve Nx2 (suave) o None si no aplica (otra indexación / vacío).
+
+    El triángulo que contiene cada punto se busca entre TODAS las caras del
+    parche cercanas a la geodésica (no solo las del corte por aristas): en mallas
+    irregulares la geodésica suave se aleja del edge_path jagged varias aristas,
+    y restringir a las del corte arrastraría los puntos de vuelta al zigzag.
+    """
+    V = np.asarray(patch["mesh"].vertices, dtype=float)
+    F = np.asarray(patch["mesh"].faces)
+    if len(V) != len(uv) or len(F) == 0:
+        return None
+    poly3d = np.asarray(seam.polyline, dtype=float)
+    if len(poly3d) < 2:
+        return None
+
+    # Prefiltro por bounding box (con margen de varias aristas) para no testear
+    # las decenas de miles de caras del parche en cada punto.
+    edge_len = float(np.median(np.linalg.norm(V[F[:, 0]] - V[F[:, 1]], axis=1)))
+    margin = max(5.0 * edge_len, 1e-6)
+    lo, hi = poly3d.min(axis=0) - margin, poly3d.max(axis=0) + margin
+    in_box = np.all((V >= lo) & (V <= hi), axis=1)
+    cand = np.flatnonzero(in_box[F].any(axis=1))
+    if cand.size == 0:
+        cand = np.arange(len(F))
+
+    tri = F[cand]
+    A, B, C = V[tri[:, 0]], V[tri[:, 1]], V[tri[:, 2]]
+    uvA, uvB, uvC = uv[tri[:, 0]], uv[tri[:, 1]], uv[tri[:, 2]]
+    return np.asarray(
+        [_bary_map_point(P, A, B, C, uvA, uvB, uvC) for P in poly3d], dtype=float
+    )
+
+
+def _real_seams_2d(patch: dict, uv: np.ndarray) -> list[dict]:
+    """Costuras REALES (straighten=False) presentes en el parche, con su tramo de
+    borde (vértices locales) y su geodésica suave ya mapeada a 2D.
+    """
+    orig = np.asarray(patch["orig_vertex_ids"])
+    g2l = {int(g): i for i, g in enumerate(orig)}
+    out = []
+    for seam in SESSION.seams.values():
+        if getattr(seam, "straighten", False):
+            continue
+        local = {g2l[int(v)] for ab in seam.edge_path for v in ab if int(v) in g2l}
+        if len(local) < 2:
+            continue
+        poly2d = _map_polyline_to_uv(seam, patch, uv)
+        if poly2d is None or len(poly2d) < 2:
+            continue
+        out.append({"local": local, "poly2d": poly2d})
+    return out
+
+
+def _orient_poly(poly2d: np.ndarray, p_start, p_end) -> list:
+    """Orienta la polilínea suave para que vaya del extremo `p_start` al `p_end`
+    del tramo de borde que reemplaza (la geodésica va waypoint0->waypointN)."""
+    fwd = np.linalg.norm(poly2d[0] - p_start) + np.linalg.norm(poly2d[-1] - p_end)
+    rev = np.linalg.norm(poly2d[0] - p_end) + np.linalg.norm(poly2d[-1] - p_start)
+    return list(poly2d if fwd <= rev else poly2d[::-1])
+
+
+def _smooth_real_seam_runs(loop: list[int], uv: np.ndarray, real_seams: list[dict]):
+    """Sustituye en el borde cada tramo de costura REAL (jagged, por aristas) por
+    su geodésica suave mapeada a 2D. Devuelve un anillo de PUNTOS 2D (Nx2)."""
+    v2seam: dict[int, int] = {}
+    for si, rs in enumerate(real_seams):
+        for v in rs["local"]:
+            v2seam.setdefault(v, si)
+    if not any(v in v2seam for v in loop):
+        return uv[loop]
+    n = len(loop)
+    start = next((i for i in range(n) if loop[i] not in v2seam), None)
+    if start is None:        # el borde entero ES una costura cerrada
+        return real_seams[v2seam[loop[0]]]["poly2d"]
+    order = list(range(start, n)) + list(range(start))
+    out: list = []
+    i = 0
+    while i < n:
+        v = loop[order[i]]
+        si = v2seam.get(v)
+        if si is None:
+            out.append(uv[v])
+            i += 1
+            continue
+        run = []
+        while i < n and v2seam.get(loop[order[i]]) == si:
+            run.append(loop[order[i]])
+            i += 1
+        if len(run) >= 2:    # reemplazar el tramo jagged por la geodésica suave
+            out.extend(_orient_poly(real_seams[si]["poly2d"], uv[run[0]], uv[run[-1]]))
+        else:
+            out.extend(uv[w] for w in run)
+    return np.asarray(out, dtype=float)
+
+
 def _patch_polygon(
-    uv: np.ndarray, faces: np.ndarray, seam_local: set[int] | None = None
+    uv: np.ndarray,
+    faces: np.ndarray,
+    union_local: set[int] | None = None,
+    real_seams: list[dict] | None = None,
 ) -> tuple[Polygon, list]:
     """Polígono shapely (exterior + agujeros) del parche en UV.
 
-    Si se pasa `seam_local`, los tramos de costura del borde se enderezan a
-    rectas (para que dos parches vecinos casen limpios en AutoCAD).
+    - `union_local`: tramos de costura de UNIÓN del borde -> se enderezan a recta
+      (Camino B; dos parches vecinos casan plano en AutoCAD).
+    - `real_seams`: costuras REALES -> su tramo jagged del borde se reemplaza por
+      la geodésica suave que dibujó el usuario (Camino A), sin zigzag.
     """
     loops = _boundary_loops(faces)
     if not loops:
         raise ExportError("Un parche no tiene borde: no se puede exportar")
-    if seam_local:
-        loops = [_straighten_seam_run(loop, seam_local) for loop in loops]
+    if union_local:
+        loops = [_straighten_seam_run(loop, union_local) for loop in loops]
         loops = [loop for loop in loops if len(loop) >= 3]
-    rings = [uv[loop] for loop in loops]
+    if real_seams:
+        rings = [_smooth_real_seam_runs(loop, uv, real_seams) for loop in loops]
+    else:
+        rings = [uv[loop] for loop in loops]
+    rings = [np.asarray(r, dtype=float) for r in rings if len(r) >= 3]
+    if not rings:
+        raise ExportError("Un parche no tiene borde válido: no se puede exportar")
     rings.sort(key=lambda r: -abs(Polygon(r).area))
     polygon = Polygon(rings[0], [r for r in rings[1:]])
     if not polygon.is_valid:
@@ -227,13 +372,17 @@ def _draw_patch(msp, pid, patch, seam_allowance_mm, add_notches, notch_spacing_m
     # faces_2d indexa a uv (en 'unfold' el net duplica vértices en los cortes;
     # en project/arap es la malla original). Fallback a la malla por si acaso.
     faces = np.asarray(patch.get("faces_2d", patch["mesh"].faces))
-    # Enderezar la costura (Camino B) solo cuando el UV está indexado por vértice
-    # original (relax/project): ahí el borde local mapea 1:1 a la malla. En
-    # 'unfold' el net reindexa, así que no se endereza (no aplica).
-    seam_local = None
+    # Procesar costuras solo cuando el UV está indexado por vértice original
+    # (relax/project): ahí el borde local mapea 1:1 a la malla y uv[v] es el 2D
+    # del vértice v. En 'unfold' el net reindexa (no aplica). Costuras de UNIÓN
+    # se enderezan a recta (Camino B); costuras REALES siguen la geodésica suave
+    # dibujada por el usuario, sin zigzag (Camino A).
+    union_local: set[int] = set()
+    real_seams: list[dict] = []
     if len(uv) == len(np.asarray(patch["mesh"].vertices)):
-        seam_local = _seam_local_vertices(patch)
-    polygon, rings = _patch_polygon(uv, faces, seam_local)
+        union_local = _seam_local_vertices(patch)
+        real_seams = _real_seams_2d(patch, uv)
+    polygon, rings = _patch_polygon(uv, faces, union_local, real_seams)
 
     # Línea de costura neta (discontinua)
     for ring in rings:
