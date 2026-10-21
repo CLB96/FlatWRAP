@@ -201,7 +201,7 @@ const Viewer = {
 
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
-    geo.setIndex(faces);
+    geo.setIndex(Array.isArray(faces) ? faces : new THREE.BufferAttribute(faces, 1));
     geo.computeVertexNormals();
 
     const mat = new THREE.MeshStandardMaterial({

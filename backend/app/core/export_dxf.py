@@ -366,8 +366,14 @@ def _draw_ring(msp, ring: np.ndarray, layer: str) -> None:
     )
 
 
-def _draw_patch(msp, pid, patch, seam_allowance_mm, add_notches, notch_spacing_mm) -> None:
-    """Dibuja un parche completo (costura, corte, muescas, etiqueta)."""
+def _patch_geometry(pid, patch, seam_allowance_mm, add_notches, notch_spacing_mm) -> dict:
+    """Calcula TODO lo que se dibuja de un parche: costura neta, contorno de
+    corte con margen, muescas y etiqueta.
+
+    Es la fuente ÚNICA de geometría: el DXF (`_draw_geometry`) y la vista
+    previa 2D (`preview_patterns`) salen de aquí, así lo que se ve en pantalla
+    es exactamente lo que se exporta.
+    """
     uv = np.asarray(patch["uv"])
     # faces_2d indexa a uv (en 'unfold' el net duplica vértices en los cortes;
     # en project/arap es la malla original). Fallback a la malla por si acaso.
@@ -384,32 +390,19 @@ def _draw_patch(msp, pid, patch, seam_allowance_mm, add_notches, notch_spacing_m
         real_seams = _real_seams_2d(patch, uv)
     polygon, rings = _patch_polygon(uv, faces, union_local, real_seams)
 
-    # Línea de costura neta (discontinua)
-    for ring in rings:
-        _draw_ring(msp, ring, "COSTURA")
-
     # Contorno de corte con margen (mitre para conservar esquinas)
     offset = polygon.buffer(seam_allowance_mm, join_style="mitre", mitre_limit=2.0)
-    geoms = getattr(offset, "geoms", [offset])
-    for geom in geoms:
-        _draw_ring(msp, np.asarray(geom.exterior.coords), "CORTE")
+    cut_rings = []
+    for geom in getattr(offset, "geoms", [offset]):
+        cut_rings.append(np.asarray(geom.exterior.coords))
         for interior in geom.interiors:
-            _draw_ring(msp, np.asarray(interior.coords), "CORTE")
+            cut_rings.append(np.asarray(interior.coords))
 
     # Muescas de alineación emparejadas por costura
+    notches = []
     if add_notches:
         for seam in SESSION.seams.values():
-            for notch in _seam_notches(seam, patch, polygon, notch_spacing_mm):
-                msp.add_line(
-                    tuple(notch["start"]),
-                    tuple(notch["end"]),
-                    dxfattribs={"layer": "MUESCAS"},
-                )
-                msp.add_text(
-                    notch["label"],
-                    height=LABEL_HEIGHT_MM,
-                    dxfattribs={"layer": "MUESCAS"},
-                ).set_placement(tuple(notch["end"] + (notch["end"] - notch["start"])))
+            notches.extend(_seam_notches(seam, patch, polygon, notch_spacing_mm))
 
     # Etiqueta del parche en su centroide (ASCII: máxima compatibilidad CAM)
     result = patch.get("flatten_result", {})
@@ -417,17 +410,47 @@ def _draw_patch(msp, pid, patch, seam_allowance_mm, add_notches, notch_spacing_m
         f"PATRON {pid}  -  {result.get('width_mm', '?')} x "
         f"{result.get('height_mm', '?')} mm"
     )
+    return {
+        "patch_id": pid,
+        "seam_rings": rings,          # costura neta (sin margen)
+        "cut_rings": cut_rings,       # contorno de corte (con margen)
+        "notches": notches,
+        "label": label,
+        "label_xy": (float(polygon.centroid.x), float(polygon.centroid.y)),
+    }
+
+
+def _draw_geometry(msp, geom: dict) -> None:
+    """Dibuja en el DXF la geometría calculada por `_patch_geometry`."""
+    for ring in geom["seam_rings"]:           # línea de costura neta (discontinua)
+        _draw_ring(msp, ring, "COSTURA")
+    for ring in geom["cut_rings"]:
+        _draw_ring(msp, ring, "CORTE")
+    for notch in geom["notches"]:
+        msp.add_line(
+            tuple(notch["start"]),
+            tuple(notch["end"]),
+            dxfattribs={"layer": "MUESCAS"},
+        )
+        msp.add_text(
+            notch["label"],
+            height=LABEL_HEIGHT_MM,
+            dxfattribs={"layer": "MUESCAS"},
+        ).set_placement(tuple(notch["end"] + (notch["end"] - notch["start"])))
     msp.add_text(
-        label, height=TEXT_HEIGHT_MM, dxfattribs={"layer": "TEXTO"}
-    ).set_placement((polygon.centroid.x, polygon.centroid.y))
+        geom["label"], height=TEXT_HEIGHT_MM, dxfattribs={"layer": "TEXTO"}
+    ).set_placement(geom["label_xy"])
 
 
-def export_patterns(
-    seam_allowance_mm: float = 10.0,
-    add_notches: bool = True,
-    notch_spacing_mm: float = 50.0,
-) -> str:
-    """Genera el DXF 1:1 con todos los parches aplanados."""
+def _collect_geometries(
+    seam_allowance_mm: float, add_notches: bool, notch_spacing_mm: float
+) -> tuple[list[dict], list[dict]]:
+    """Geometría de todos los parches aplanados + los que NO se pudieron generar.
+
+    Un parche problemático (borde degenerado, polígono inválido) no debe tumbar
+    ni colgar todo el export: se salta, pero se REPORTA (id y motivo) para que
+    nunca falte un patrón en el resultado sin que el usuario se entere.
+    """
     patches = {
         pid: p for pid, p in SESSION.patches.items() if p.get("uv") is not None
     }
@@ -436,24 +459,82 @@ def export_patterns(
             "No hay parches aplanados: ejecuta 'Segmentar' y 'Aplanar todo' "
             "antes de exportar."
         )
-
-    doc, msp = _setup_document()
-
-    n = 0
+    geoms: list[dict] = []
+    skipped: list[dict] = []
     for pid, patch in sorted(patches.items()):
-        # Un parche problemático (borde degenerado, polígono inválido) NO debe
-        # tumbar ni colgar todo el export: lo saltamos y seguimos.
         try:
-            _draw_patch(msp, pid, patch, seam_allowance_mm, add_notches, notch_spacing_mm)
-            n += 1
-        except Exception:
-            continue
-
-    if n == 0:
+            geoms.append(
+                _patch_geometry(
+                    pid, patch, seam_allowance_mm, add_notches, notch_spacing_mm
+                )
+            )
+        except Exception as e:  # noqa: BLE001 - se reporta, no se traga
+            skipped.append({"patch_id": pid, "error": f"{type(e).__name__}: {e}"})
+    if not geoms:
         raise ExportError(
             "No se pudo generar el contorno de ningún parche "
             "(bordes degenerados tras el aplanado)."
         )
+    return geoms, skipped
+
+
+def preview_patterns(
+    seam_allowance_mm: float = 10.0,
+    add_notches: bool = True,
+    notch_spacing_mm: float = 50.0,
+) -> dict:
+    """Geometría de corte en JSON para la vista previa 2D (misma que el DXF).
+
+    Coordenadas en mm, en el mismo marco que `uv` del aplanado (los parches ya
+    vienen acomodados en fila), redondeadas a 0.01 mm.
+    """
+    geoms, skipped = _collect_geometries(
+        seam_allowance_mm, add_notches, notch_spacing_mm
+    )
+
+    def r2(a) -> list:
+        return np.round(np.asarray(a, dtype=float), 2).tolist()
+
+    return {
+        "seam_allowance_mm": seam_allowance_mm,
+        "patches": [
+            {
+                "patch_id": g["patch_id"],
+                "seam_rings": [r2(r) for r in g["seam_rings"]],
+                "cut_rings": [r2(r) for r in g["cut_rings"]],
+                "notches": [
+                    {"start": r2(n["start"]), "end": r2(n["end"]), "label": n["label"]}
+                    for n in g["notches"]
+                ],
+                "label": g["label"],
+            }
+            for g in geoms
+        ],
+        "skipped": skipped,
+    }
+
+
+def export_patterns(
+    seam_allowance_mm: float = 10.0,
+    add_notches: bool = True,
+    notch_spacing_mm: float = 50.0,
+    report: dict | None = None,
+) -> str:
+    """Genera el DXF 1:1 con todos los parches aplanados.
+
+    Si se pasa `report`, se llena con `report["skipped"]`: los parches que no
+    pudieron dibujarse (id y motivo), para avisarlo al usuario.
+    """
+    geoms, skipped = _collect_geometries(
+        seam_allowance_mm, add_notches, notch_spacing_mm
+    )
+    if report is not None:
+        report["skipped"] = skipped
+
+    doc, msp = _setup_document()
+    for g in geoms:
+        _draw_geometry(msp, g)
+    n = len(geoms)
     msp.add_text(
         f"FlatWrap - {n} patron(es) - escala 1:1 (mm) - "
         f"margen {seam_allowance_mm} mm - {date.today()}",

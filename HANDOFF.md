@@ -67,9 +67,13 @@ ajustarlo.
 - `geodesics.py` — costura = **GEODÉSICA exacta** (pp3d) sobre copia MANIFOLD
   (`_manifold_copy` + vmap; pp3d no acepta non-manifold). edge_path Dijkstra para corte.
 - `segmentation.py` — divide Cara A por costuras (componentes conexas). `_fill_selection_holes`.
-- `flattening.py` — `relax`=SLIM (DEFAULT, init Tutte uniforme + converge), `unfold`,
+  `snap_seam_endpoints`: prolonga extremos de costura ≤ `snap_mm` (def. 5) hasta el borde de la Cara A / otra costura.
+- `project.py` — guardar/abrir `.flatwrap` (malla limpia + costuras + Cara A + ajustes; los parches se regeneran).
+- `flattening.py` — `relax`=SLIM (DEFAULT, init Tutte uniforme; lotes de 5 con parada adaptativa por p95 de estiramiento + cache por contenido de malla), `unfold`,
   `project`. **Rellena huecos interiores SOLO para el solve** (MEJORA-18, all-or-nothing).
   Expone s1/s2 por cara (tolerancia). Mapa de tensión.
+- `export_dxf.py` — `_patch_geometry` es la ÚNICA fuente de geometría: la usan el DXF y `POST /api/export/preview` (contorno de corte en la vista 2D). Parches omitidos → cabecera `X-FlatWrap-Skipped`.
+- Frontend `pattern2d.js`: zoom/paneo, Path2D en caché (NO usar `closePath()` por triángulo: O(n²) en Chromium), bitmap en caché en mallas >20k caras.
 - `seam_cut.py` — imprint geodésico (split triángulos). **NO integrado** (frágil en 3D);
   útil su mapeo punto→triángulo para la tarea de arriba.
 - `export_dxf.py` — DXF 1:1, capas CORTE/COSTURA/MUESCA/TEXTO. **Camino B**: endereza

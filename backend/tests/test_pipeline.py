@@ -572,3 +572,212 @@ def test_export_dxf_layers_and_scale(cylinder_session, tmp_path, monkeypatch):
     # Escala 1:1: el bbox del corte debe superar al patrón neto por el margen
     xs = [p[0] for e in cut_lines for p in e.get_points("xy")]
     assert max(xs) - min(xs) > EXPECTED_WIDTH  # patrón + margen
+
+
+def _two_patch_session():
+    """Medio cilindro con una costura de borde a borde -> 2 parches aplanados."""
+    a, b = _edge_boundary_vertices(SESSION.mesh)
+    geodesics.create_seam([a, b])
+    segmentation.segment_by_seams(_all_faces())
+    flattening.flatten_all_patches()
+
+
+def test_preview_matches_dxf_geometry(cylinder_session, tmp_path, monkeypatch):
+    # La vista previa 2D y el DXF salen de la MISMA geometría: lo que se ve en
+    # pantalla es lo que se exporta (mismo conteo de contornos, muescas y bbox).
+    monkeypatch.setattr(export_dxf, "OUTPUT_DIR", tmp_path)
+    _two_patch_session()
+
+    prev = export_dxf.preview_patterns(10.0, True, 50.0)
+    assert len(prev["patches"]) == 2 and prev["skipped"] == []
+
+    msp = ezdxf.readfile(export_dxf.export_patterns(10.0, True, 50.0)).modelspace()
+    cut = [e for e in msp if e.dxf.layer == "CORTE"]
+    seam = [e for e in msp if e.dxf.layer == "COSTURA"]
+    notch = [e for e in msp if e.dxf.layer == "MUESCAS" and e.dxftype() == "LINE"]
+    assert len(cut) == sum(len(p["cut_rings"]) for p in prev["patches"])
+    assert len(seam) == sum(len(p["seam_rings"]) for p in prev["patches"])
+    assert len(notch) == sum(len(p["notches"]) for p in prev["patches"]) > 0
+
+    xs_prev = [pt[0] for p in prev["patches"] for r in p["cut_rings"] for pt in r]
+    xs_dxf = [pt[0] for e in cut for pt in e.get_points("xy")]
+    assert max(xs_prev) == pytest.approx(max(xs_dxf), abs=0.02)
+    assert min(xs_prev) == pytest.approx(min(xs_dxf), abs=0.02)
+
+
+def test_preview_respects_options(cylinder_session):
+    # Sin muescas no hay muescas; un margen mayor ensancha el contorno de corte.
+    _two_patch_session()
+    p0 = export_dxf.preview_patterns(5.0, False, 50.0)
+    p1 = export_dxf.preview_patterns(20.0, False, 50.0)
+    assert all(not p["notches"] for p in p0["patches"])
+    width = lambda prev: max(  # noqa: E731
+        pt[0] for p in prev["patches"] for r in p["cut_rings"] for pt in r
+    ) - min(pt[0] for p in prev["patches"] for r in p["cut_rings"] for pt in r)
+    assert width(p1) > width(p0) + 20.0
+
+
+def _break_patch_zero(monkeypatch):
+    real = export_dxf._patch_geometry
+
+    def flaky(pid, *args, **kwargs):
+        if pid == 0:
+            raise ValueError("boom")
+        return real(pid, *args, **kwargs)
+
+    monkeypatch.setattr(export_dxf, "_patch_geometry", flaky)
+
+
+def test_export_reports_skipped_patches(cylinder_session, tmp_path, monkeypatch):
+    # Un parche que falla NO tumba el export, pero ya no desaparece en silencio:
+    # se reporta con su id y el motivo.
+    monkeypatch.setattr(export_dxf, "OUTPUT_DIR", tmp_path)
+    _two_patch_session()
+    _break_patch_zero(monkeypatch)
+
+    report: dict = {}
+    path = export_dxf.export_patterns(10.0, True, 50.0, report=report)
+    assert [s["patch_id"] for s in report["skipped"]] == [0]
+    assert "boom" in report["skipped"][0]["error"]
+    msp = ezdxf.readfile(path).modelspace()
+    assert len([e for e in msp if e.dxf.layer == "CORTE"]) >= 1  # el otro sí salió
+
+    prev = export_dxf.preview_patterns(10.0, True, 50.0)
+    assert len(prev["patches"]) == 1
+    assert prev["skipped"][0]["patch_id"] == 0
+
+
+def test_export_api_preview_and_skipped_header(cylinder_session, tmp_path, monkeypatch):
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    monkeypatch.setattr(export_dxf, "OUTPUT_DIR", tmp_path)
+    _two_patch_session()
+    client = TestClient(app)
+    body = {"seam_allowance_mm": 10.0, "add_notches": True, "notch_spacing_mm": 50.0}
+
+    r = client.post("/api/export/preview", json=body)
+    assert r.status_code == 200 and len(r.json()["patches"]) == 2
+    ok = client.post("/api/export/dxf", json=body)
+    assert ok.status_code == 200 and "x-flatwrap-skipped" not in ok.headers
+
+    _break_patch_zero(monkeypatch)
+    bad = client.post("/api/export/dxf", json=body)
+    assert bad.status_code == 200
+    assert bad.headers["x-flatwrap-skipped"] == "0"
+
+
+def _short_seam_vertices(mesh, gap_mm):
+    """Vértices sobre theta=pi/2 que quedan ~gap_mm antes de cada borde."""
+    v = np.asarray(mesh.vertices)
+    col = np.flatnonzero(np.abs(v[:, 0]) < 1.0)
+    ys = v[col, 1]
+    a = col[np.argmin(np.abs(ys - gap_mm))]
+    b = col[np.argmin(np.abs(ys - (LENGTH - gap_mm)))]
+    return int(a), int(b)
+
+
+def test_seam_endpoint_snaps_to_boundary(cylinder_session):
+    # Una costura que se queda unos mm corta NO separaba la cara A; con snap se
+    # prolonga hasta el borde y sí divide. snap_mm=0 conserva el comportamiento viejo.
+    a, b = _short_seam_vertices(SESSION.mesh, gap_mm=3.0)
+    geodesics.create_seam([a, b])
+    off = segmentation.segment_by_seams(_all_faces(), snap_mm=0)
+    assert off["n_patches"] == 1 and off["snaps"] == []
+
+    on = segmentation.segment_by_seams(_all_faces(), snap_mm=12.0)
+    assert on["n_patches"] == 2
+    assert len(on["snaps"]) >= 1 and all(s["dist_mm"] <= 12.0 for s in on["snaps"])
+    assert any("prolongado" in w for w in on["warnings"])
+    # La costura registrada no se muta (la extensión es solo del segmentado)
+    assert len(SESSION.seams) == 1
+
+
+def test_seam_snap_respects_tolerance(cylinder_session):
+    a, b = _short_seam_vertices(SESSION.mesh, gap_mm=30.0)
+    geodesics.create_seam([a, b])
+    res = segmentation.segment_by_seams(_all_faces(), snap_mm=5.0)
+    assert res["n_patches"] == 1 and res["snaps"] == []
+
+
+def test_slim_adaptive_stop_and_cache(cylinder_session, monkeypatch):
+    # SLIM para pronto cuando el estiramiento ya no mejora y, al re-aplanar la
+    # misma malla (p. ej. tras borrar OTRO parche), no recalcula: sale del cache.
+    import igl
+
+    flattening._SLIM_CACHE.clear()
+    calls = {"n": 0}
+    real = igl.slim_solve
+
+    def counting(data, n):
+        calls["n"] += n
+        return real(data, n)
+
+    monkeypatch.setattr(igl, "slim_solve", counting)
+    _two_patch_session()
+    flattening.flatten_all_patches("relax")
+    first = calls["n"]
+    assert 0 < first < 2 * flattening.SLIM_MAX_ITERS  # no agota el tope
+
+    res = flattening.flatten_all_patches("relax")
+    assert calls["n"] == first                         # 2º aplanado: 0 iteraciones nuevas
+    assert len(res["patches"]) == 2
+
+
+def test_project_roundtrip(cylinder_session):
+    # Guardar -> reiniciar -> abrir: misma malla, mismas costuras (mismos vértices)
+    # y misma Cara A; los parches se regeneran igual (mismo conteo).
+    from app.core import project
+
+    a, b = _edge_boundary_vertices(SESSION.mesh)
+    geodesics.create_seam([a, b])
+    SESSION.seams[1].straighten = True
+    sel = _all_faces()[:50]
+    blob = project.save_project(sel, {"allowance": 12}, "pieza.stl")
+    assert len(blob) < 500_000
+
+    v0 = np.asarray(SESSION.mesh.vertices).copy()
+    f0 = np.asarray(SESSION.mesh.faces).copy()
+    SESSION.reset()
+    out = project.load_project(blob)
+
+    assert np.array_equal(np.asarray(SESSION.mesh.vertices), v0)
+    assert np.array_equal(np.asarray(SESSION.mesh.faces), f0)
+    assert out["selected_faces"] == sel and out["settings"] == {"allowance": 12}
+    assert len(out["seams"]) == 1 and out["seams"][0]["straighten"] is True
+    assert SESSION.seams[out["seams"][0]["seam_id"]].vertex_ids == [a, b]
+    assert segmentation.segment_by_seams(_all_faces())["n_patches"] == 2
+
+
+def test_project_rejects_garbage():
+    from app.core import project
+
+    with pytest.raises(project.ProjectError):
+        project.load_project(b"no soy un proyecto")
+
+
+def test_geometry_binary_roundtrip(cylinder_session):
+    v = np.asarray(SESSION.mesh.vertices, dtype=np.float32)
+    f = np.asarray(SESSION.mesh.faces, dtype=np.uint32)
+    blob = mesh_io.geometry_binary(SESSION.mesh)
+    nv, nf = np.frombuffer(blob, dtype="<u4", count=2)
+    assert (nv, nf) == (len(v), len(f))
+    assert len(blob) == 8 + v.nbytes + f.nbytes
+    v2 = np.frombuffer(blob, dtype="<f4", count=nv * 3, offset=8).reshape(-1, 3)
+    f2 = np.frombuffer(blob, dtype="<u4", count=nf * 3, offset=8 + nv * 12).reshape(-1, 3)
+    assert np.array_equal(v2, v) and np.array_equal(f2, f)
+
+
+def test_api_gzip_and_binary_geometry(cylinder_session):
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    c = TestClient(app)
+    r = c.get("/api/mesh/geometry.bin")
+    assert r.status_code == 200 and r.content == mesh_io.geometry_binary(SESSION.mesh)
+    big = c.get("/api/mesh/geometry", headers={"Accept-Encoding": "gzip"})
+    assert big.headers.get("content-encoding") == "gzip"

@@ -19,3 +19,4 @@ networkx>=3.0                  # conectividad de parches - Fase 3
 # Exportación
 ezdxf>=1.2.0                   # DXF escala 1:1 - Fase 5
 shapely>=2.0.0                 # offset del margen de costura - Fase 5
+httpx  # solo para tests de la API (TestClient)

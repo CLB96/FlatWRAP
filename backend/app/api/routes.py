@@ -11,7 +11,7 @@ Flujo completo:
 """
 
 from fastapi import APIRouter, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from app.core import (
     mesh_io,
@@ -20,6 +20,7 @@ from app.core import (
     selection,
     flattening,
     export_dxf,
+    project,
 )
 from app.core.session import SESSION
 from app.models.schemas import (
@@ -27,6 +28,7 @@ from app.models.schemas import (
     FloodRequest,
     GeodesicRequest,
     MeshSummary,
+    ProjectSaveRequest,
     SeamPreviewRequest,
     SegmentRequest,
     SelectionInfoRequest,
@@ -53,6 +55,19 @@ def get_geometry():
     if SESSION.mesh is None:
         raise HTTPException(status_code=404, detail="No hay malla cargada")
     return JSONResponse(mesh_io.geometry_payload(SESSION.mesh))
+
+
+@router.get("/mesh/geometry.bin")
+def get_geometry_binary():
+    """Misma geometría en binario: [nV u32][nF u32][vértices f32 x3][caras u32 x3].
+
+    ~10x más chico y sin parsear JSON de millones de números (mallas densas).
+    """
+    if SESSION.mesh is None:
+        raise HTTPException(status_code=404, detail="No hay malla cargada")
+    return Response(
+        mesh_io.geometry_binary(SESSION.mesh), media_type="application/octet-stream"
+    )
 
 
 @router.post("/mesh/subdivide", response_model=MeshSummary)
@@ -145,7 +160,7 @@ def segment(req: SegmentRequest):
     if SESSION.mesh is None:
         raise HTTPException(status_code=404, detail="No hay malla cargada")
     try:
-        return segmentation.segment_by_seams(req.selected_faces)
+        return segmentation.segment_by_seams(req.selected_faces, snap_mm=req.snap_mm)
     except segmentation.SegmentationError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
 
@@ -191,15 +206,67 @@ def flatten_all(method: str = "relax"):
 
 
 # ----------------------------------------------------------------- Fase 5
-@router.post("/export/dxf")
-def export(req: ExportRequest):
-    """Genera el DXF escala 1:1 (mm) con todos los parches aplanados."""
+@router.post("/export/preview")
+def export_preview(req: ExportRequest):
+    """Contorno de corte (margen, muescas, costuras) en JSON para la vista 2D.
+
+    Usa la MISMA geometría que el DXF: lo que se ve es lo que se exporta. También
+    informa los parches que no se pudieron generar (`skipped`).
+    """
     try:
-        path = export_dxf.export_patterns(
+        return export_dxf.preview_patterns(
             seam_allowance_mm=req.seam_allowance_mm,
             add_notches=req.add_notches,
             notch_spacing_mm=req.notch_spacing_mm,
         )
     except export_dxf.ExportError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
-    return FileResponse(path, filename="flatwrap_pattern.dxf")
+
+
+@router.post("/export/dxf")
+def export(req: ExportRequest):
+    """Genera el DXF escala 1:1 (mm) con todos los parches aplanados.
+
+    Si algún parche no se pudo dibujar, sus ids van en la cabecera
+    `X-FlatWrap-Skipped` (nunca se omite un patrón sin avisar).
+    """
+    report: dict = {}
+    try:
+        path = export_dxf.export_patterns(
+            seam_allowance_mm=req.seam_allowance_mm,
+            add_notches=req.add_notches,
+            notch_spacing_mm=req.notch_spacing_mm,
+            report=report,
+        )
+    except export_dxf.ExportError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    headers = {}
+    skipped = report.get("skipped", [])
+    if skipped:
+        headers["X-FlatWrap-Skipped"] = ",".join(str(s["patch_id"]) for s in skipped)
+    return FileResponse(path, filename="flatwrap_pattern.dxf", headers=headers)
+
+
+# ------------------------------------------------------------- Proyecto
+@router.post("/project/save")
+def project_save(req: ProjectSaveRequest):
+    """Descarga el proyecto (.flatwrap): malla limpia + costuras + Cara A + ajustes."""
+    try:
+        blob = project.save_project(req.selected_faces, req.settings, req.name)
+    except project.ProjectError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    fname = (req.name.rsplit(".", 1)[0] or "proyecto") + ".flatwrap"
+    return Response(
+        blob,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+@router.post("/project/load")
+async def project_load(file: UploadFile):
+    """Abre un proyecto: restaura malla y costuras (los parches se regeneran)."""
+    try:
+        return project.load_project(await file.read())
+    except project.ProjectError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e

@@ -61,6 +61,9 @@ class SegmentRequest(BaseModel):
     """Subdivisión de la cara A: requiere las caras seleccionadas."""
 
     selected_faces: list[int] = Field(min_length=1)
+    # Tolerancia (mm) para prolongar el extremo de una costura hasta el borde
+    # de la Cara A / otra costura. 0 = desactivado.
+    snap_mm: float = Field(default=5.0, ge=0, le=50)
 
 
 class SegmentationResponse(BaseModel):
@@ -87,3 +90,11 @@ class ExportRequest(BaseModel):
     seam_allowance_mm: float = 10.0
     add_notches: bool = True
     notch_spacing_mm: float = 50.0
+
+
+class ProjectSaveRequest(BaseModel):
+    """Estado que solo conoce el frontend (Cara A, ajustes) para guardar el proyecto."""
+
+    selected_faces: list[int] = Field(default_factory=list)
+    settings: dict = Field(default_factory=dict)
+    name: str = ""

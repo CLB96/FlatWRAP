@@ -17,6 +17,7 @@ window.addEventListener('DOMContentLoaded', () => {
     try {
       setStatus('Cargando y limpiando malla…');
       const info = await API.uploadMesh(file);
+      projectName = file.name;
       const geo = await API.getGeometry();
       Viewer.loadGeometry(geo);
       Selection.reset();
@@ -31,6 +32,62 @@ window.addEventListener('DOMContentLoaded', () => {
       setStatus('Malla lista ✓ · selecciona la Cara A');
     } catch (err) { setStatus(err.message, true); }
     e.target.value = '';  // permite recargar el mismo archivo
+  });
+
+  // --- Proyecto: guardar / abrir (.flatwrap)
+  let projectName = 'proyecto';
+  const settingIds = ['inpAllowance', 'chkNotches', 'inpNotchSpacing', 'inpSnap',
+    'inpWarp', 'inpWeft', 'inpComp', 'chkTolerance', 'chkHeatmap'];
+  const readSettings = () => {
+    const o = { method: flattenMethod };
+    for (const id of settingIds) {
+      const el = document.getElementById(id);
+      o[id] = el.type === 'checkbox' ? el.checked : el.value;
+    }
+    return o;
+  };
+  const applySettings = (o) => {
+    for (const id of settingIds) {
+      if (!(id in o)) continue;
+      const el = document.getElementById(id);
+      if (el.type === 'checkbox') el.checked = !!o[id]; else el.value = o[id];
+      el.dispatchEvent(new Event(el.type === 'checkbox' ? 'change' : 'input'));
+    }
+    if (o.method && window.setFlattenMethod) window.setFlattenMethod(o.method);
+  };
+  document.getElementById('btnSaveProject').addEventListener('click', async () => {
+    try {
+      await API.saveProject([...Selection.faces], readSettings(), projectName);
+      setStatus('Proyecto guardado ✓');
+    } catch (err) { setStatus(err.message, true); }
+  });
+  document.getElementById('projectInput').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      setStatus('Abriendo proyecto…');
+      const res = await API.loadProject(file);
+      Viewer.loadGeometry(await API.getGeometry());
+      Selection.reset();
+      Seams.resetAll();
+      Pattern2D.hide();
+      document.getElementById('segmentInfo').textContent = '';
+      document.getElementById('patchList').innerHTML = '';
+      res.seams.forEach((s) => Seams.restore(s));
+      Seams.refreshList();
+      Selection.faces = new Set(res.selected_faces);
+      if (Selection.faces.size) { Selection.recolor(); Selection.commitInfo(); }
+      projectName = res.name || file.name;
+      const info = res.summary;
+      const dims = info.bbox_max.map((v, i) => (v - info.bbox_min[i]).toFixed(0));
+      document.getElementById('meshInfo').textContent =
+        `${info.n_vertices.toLocaleString()} vértices · ${info.n_faces.toLocaleString()} caras\n` +
+        `BBox: ${dims[0]} × ${dims[1]} × ${dims[2]} mm`;
+      applySettings(res.settings || {});
+      const w = res.warnings.length ? ` · ⚠ ${res.warnings.join(' ')}` : '';
+      setStatus(`Proyecto abierto ✓ · ${res.seams.length} costura(s)${w}`, !!res.warnings.length);
+    } catch (err) { setStatus(err.message, true); }
+    e.target.value = '';
   });
 
   // --- Cámara: barra de vistas
@@ -137,6 +194,7 @@ window.addEventListener('DOMContentLoaded', () => {
       document.getElementById(id).classList.toggle('active', m === name);
     }
   };
+  window.setFlattenMethod = setMethod;   // lo usa "Abrir proyecto"
   document.getElementById('btnMethodUnfold').addEventListener('click', () => setMethod('unfold'));
   document.getElementById('btnMethodRelax').addEventListener('click', () => setMethod('relax'));
   document.getElementById('btnMethodProject').addEventListener('click', () => setMethod('project'));
@@ -154,11 +212,42 @@ window.addEventListener('DOMContentLoaded', () => {
     }
   };
 
+  // Opciones de exportación (compartidas por el DXF y la vista previa de corte)
+  const exportOpts = () => ({
+    seam_allowance_mm: parseFloat(document.getElementById('inpAllowance').value) || 10,
+    add_notches: document.getElementById('chkNotches').checked,
+    notch_spacing_mm: parseFloat(document.getElementById('inpNotchSpacing').value) || 50,
+  });
+
+  // Pide el contorno de corte al backend si el check está activo (con descarte
+  // de respuestas viejas si el usuario cambia opciones rápido).
+  let cutSeq = 0, cutTimer = 0;
+  const refreshCut = async () => {
+    const on = document.getElementById('chkCut').checked;
+    Pattern2D.setCutOn(on);
+    // Sin patrones aplanados no hay contorno que pedir (evita un 422 inútil)
+    if (!on || !Pattern2D.lastPatches || document.getElementById('pattern2d').classList.contains('hidden')) return;
+    const my = ++cutSeq;
+    try {
+      const cut = await API.previewCut(exportOpts());
+      if (my !== cutSeq) return;
+      Pattern2D.setCut(cut);
+      if (cut.skipped && cut.skipped.length) {
+        setStatus(`⚠ Sin contorno de corte en patrón(es): ${cut.skipped.map((s) => s.patch_id).join(', ')}`, true);
+      }
+    } catch (err) { if (my === cutSeq) setStatus(err.message, true); }
+  };
+  const refreshCutSoon = () => {
+    clearTimeout(cutTimer);
+    cutTimer = setTimeout(refreshCut, 250);
+  };
+
   // Muestra el resultado del aplanado (2D + estado + lista). seg puede ser null
   // al re-aplanar tras borrar un patrón.
   const showFlattenResult = (res, nSegPatches) => {
     const ok = res.patches, failed = res.failed || [];
     Pattern2D.show(ok);
+    if (document.getElementById('chkCut').checked) refreshCut();
     renderPatchList([...ok, ...failed]);
 
     const tag = { unfold: 'desplegado', relax: 'relajado', project: 'proyección' }[flattenMethod];
@@ -184,7 +273,7 @@ window.addEventListener('DOMContentLoaded', () => {
     try {
       if (!Selection.faces.size) return setStatus('Selecciona primero la Cara A', true);
       setStatus('Generando patrones…');
-      const seg = await API.segment([...Selection.faces]);
+      const seg = await API.segment([...Selection.faces], parseFloat(document.getElementById('inpSnap').value) || 0);
       Viewer.showPatches(seg.face_patch, seg.n_patches);
 
       const warns = seg.warnings.length ? `\n⚠ ${seg.warnings.join('\n⚠ ')}` : '';
@@ -262,6 +351,10 @@ window.addEventListener('DOMContentLoaded', () => {
   ['inpWarp', 'inpWeft', 'inpComp'].forEach((id) =>
     document.getElementById(id).addEventListener('input', syncTol));
   document.getElementById('btnClose2d').addEventListener('click', () => Pattern2D.hide());
+  document.getElementById('btnFit2d').addEventListener('click', () => Pattern2D.fit());
+  document.getElementById('chkCut').addEventListener('change', refreshCut);
+  ['inpAllowance', 'chkNotches', 'inpNotchSpacing'].forEach((id) =>
+    document.getElementById(id).addEventListener('input', refreshCutSoon));
   addEventListener('resize', () => {
     if (!document.getElementById('pattern2d').classList.contains('hidden')) {
       Pattern2D.render();
@@ -272,12 +365,12 @@ window.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btnExport').addEventListener('click', async () => {
     try {
       setStatus('Generando DXF…');
-      await API.exportDXF({
-        seam_allowance_mm: parseFloat(document.getElementById('inpAllowance').value) || 10,
-        add_notches: document.getElementById('chkNotches').checked,
-        notch_spacing_mm: parseFloat(document.getElementById('inpNotchSpacing').value) || 50,
-      });
-      setStatus('DXF descargado ✓');
+      const { skipped } = await API.exportDXF(exportOpts());
+      if (skipped.length) {
+        setStatus(`DXF descargado, pero SIN el/los patrón(es) ${skipped.join(', ')} (no se pudieron dibujar)`, true);
+      } else {
+        setStatus('DXF descargado ✓');
+      }
     } catch (err) { setStatus(err.message, true); }
   });
 });

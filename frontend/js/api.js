@@ -10,10 +10,38 @@ const API = {
     return r.json();
   },
 
-  async getGeometry() {
-    const r = await fetch(`${this.base}/mesh/geometry`);
-    if (!r.ok) throw new Error('No hay malla cargada');
+  // Proyecto (.flatwrap): malla limpia + costuras + Cara A + ajustes
+  async saveProject(selectedFaces, settings, name) {
+    const r = await fetch(`${this.base}/project/save`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ selected_faces: selectedFaces, settings, name }),
+    });
+    if (!r.ok) throw new Error((await r.json()).detail);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(await r.blob());
+    a.download = (name.replace(/\.[^.]+$/, '') || 'proyecto') + '.flatwrap';
+    a.click();
+  },
+
+  async loadProject(file) {
+    const fd = new FormData();
+    fd.append('file', file);
+    const r = await fetch(`${this.base}/project/load`, { method: 'POST', body: fd });
+    if (!r.ok) throw new Error((await r.json()).detail);
     return r.json();
+  },
+
+  // Geometría binaria (Float32/Uint32): sin parsear JSON de millones de números
+  async getGeometry() {
+    const r = await fetch(`${this.base}/mesh/geometry.bin`);
+    if (!r.ok) throw new Error('No hay malla cargada');
+    const buf = await r.arrayBuffer();
+    const [nV, nF] = new Uint32Array(buf, 0, 2);
+    return {
+      vertices: new Float32Array(buf, 8, nV * 3),
+      faces: new Uint32Array(buf, 8 + nV * 12, nF * 3),
+    };
   },
 
   async createSeam(vertexIds, closed = false) {
@@ -69,11 +97,11 @@ const API = {
     return r.json();
   },
 
-  async segment(selectedFaces) {
+  async segment(selectedFaces, snapMm = 5) {
     const r = await fetch(`${this.base}/segment`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ selected_faces: selectedFaces }),
+      body: JSON.stringify({ selected_faces: selectedFaces, snap_mm: snapMm }),
     });
     if (!r.ok) throw new Error((await r.json()).detail);
     return r.json();
@@ -104,10 +132,24 @@ const API = {
       body: JSON.stringify(opts),
     });
     if (!r.ok) throw new Error((await r.json()).detail || 'Error al exportar DXF');
+    // Parches que no se pudieron dibujar (nunca se omiten sin avisar)
+    const skipped = (r.headers.get('X-FlatWrap-Skipped') || '').split(',').filter(Boolean);
     const blob = await r.blob();
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = 'flatwrap_pattern.dxf';
     a.click();
+    return { skipped };
+  },
+
+  // Contorno de corte (misma geometría que el DXF) para la vista 2D
+  async previewCut(opts = {}) {
+    const r = await fetch(`${this.base}/export/preview`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(opts),
+    });
+    if (!r.ok) throw new Error((await r.json()).detail || 'Error en la vista previa de corte');
+    return r.json();
   },
 };

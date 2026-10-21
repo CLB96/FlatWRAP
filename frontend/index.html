@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>FlatWrap · 3D → Patrón 2D</title>
-<link rel="stylesheet" href="css/style.css?v=20">
+<link rel="stylesheet" href="css/style.css?v=22">
 </head>
 <body>
   <!-- Visor 3D a pantalla completa -->
@@ -35,6 +35,11 @@
       <h2>1 · Malla</h2>
       <label class="btn" for="fileInput">Cargar STL / STEP / OBJ</label>
       <input type="file" id="fileInput" accept=".stl,.step,.stp,.obj,.ply,.glb,.gltf,.3mf,.off" hidden>
+      <div class="brush-row">
+        <button class="btn ghost" id="btnSaveProject" title="Guarda malla, costuras, Cara A y ajustes en un archivo .flatwrap">💾 Guardar proyecto</button>
+        <label class="btn ghost" for="projectInput" title="Abre un .flatwrap: restaura malla, costuras y Cara A">📂 Abrir proyecto</label>
+        <input type="file" id="projectInput" accept=".flatwrap" hidden>
+      </div>
       <button class="btn ghost" id="btnSubdivide" title="Refina la malla (4x triángulos) para suavizar el aplanado. Reinicia la selección.">⊞ Refinar malla</button>
       <label class="check" title="Resalta los cantos donde cambia el ángulo (dónde acaba una curva y empieza una recta). Útil con la luz pareja sin sombras."><input type="checkbox" id="chkEdges" checked> Aristas (cambios de ángulo)</label>
       <div class="field">
@@ -97,6 +102,10 @@ pieza). También puedes marcarlas después y volver a generar. Ctrl+Z deshace.</
         <button class="btn ghost" id="btnMethodUnfold" title="Despliega cada cara sobre su pliegue (papercraft): tamaño real exacto, pero RASGA en doble curvatura (libera la curvatura como cortes).">Desplegado</button>
         <button class="btn ghost" id="btnMethodProject" title="Sombra ortogonal sobre el plano: coincide con la vista, subestima zonas curvas">Proyección</button>
       </div>
+      <div class="field">
+        <label for="inpSnap" title="Si una costura termina a pocos mm del borde de la Cara A (o de otra costura) y no llega a cortar, se prolonga hasta el borde. 0 = desactivar.">Prolongar costura al borde (mm)</label>
+        <input type="number" id="inpSnap" value="5" min="0" max="50" step="1">
+      </div>
       <button class="btn" id="btnGenerate">Generar patrón(es)</button>
       <label class="check"><input type="checkbox" id="chkHeatmap" checked> Mapa de tensión</label>
       <label class="check" title="Pinta verde lo que tu material aguanta (según la TDS) y rojo lo que lo excede. Útil para decidir cuántos patrones necesitas."><input type="checkbox" id="chkTolerance"> Modo tolerancia (material)</label>
@@ -133,6 +142,12 @@ las costuras que hayas marcado.</div>
 
   <!-- Vista del patrón 2D (se abre al generar) -->
   <div id="pattern2d" class="pattern2d hidden">
+    <div class="toolbar2d">
+      <label class="check" title="Muestra el contorno de corte real (con margen de costura y muescas): es la misma geometría que el DXF."><input type="checkbox" id="chkCut"> Contorno de corte</label>
+      <button class="btn ghost" id="btnFit2d" title="Encuadrar todo (doble clic en el lienzo)">Encuadrar</button>
+      <span class="hint2d">rueda = zoom · arrastrar = mover</span>
+    </div>
+    <span id="coords2d" class="coords2d"></span>
     <button class="btn ghost close" id="btnClose2d">✕</button>
     <canvas id="patternCanvas"></canvas>
   </div>
@@ -142,11 +157,11 @@ las costuras que hayas marcado.</div>
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/STLLoader.js"></script>
 
-  <script src="js/api.js?v=20"></script>
-  <script src="js/viewer.js?v=20"></script>
-  <script src="js/selection.js?v=20"></script>
-  <script src="js/seams.js?v=20"></script>
-  <script src="js/pattern2d.js?v=20"></script>
-  <script src="js/main.js?v=20"></script>
+  <script src="js/api.js?v=22"></script>
+  <script src="js/viewer.js?v=22"></script>
+  <script src="js/selection.js?v=22"></script>
+  <script src="js/seams.js?v=22"></script>
+  <script src="js/pattern2d.js?v=22"></script>
+  <script src="js/main.js?v=22"></script>
 </body>
 </html>

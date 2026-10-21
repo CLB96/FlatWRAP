@@ -26,7 +26,8 @@ Interfaz común guardada en el parche:
     patch["orig_to_uv"] vértice local original -> 2D (para muescas DXF)
 """
 
-from collections import defaultdict, deque
+import hashlib
+from collections import OrderedDict, defaultdict, deque
 
 import igl
 import numpy as np
@@ -166,12 +167,23 @@ def _initial_uv(V: np.ndarray, F: np.ndarray, boundary: np.ndarray) -> np.ndarra
     return uv
 
 
-# SLIM se itera en lotes hasta que el net deja de moverse (convergencia):
-# los parches fáciles paran en ~50 iters; un disco que envuelve fuerte (doble
-# curvatura real) necesita ~175. El tope evita colgarse en mallas patológicas.
-SLIM_BATCH = 25
+# SLIM se itera en lotes pequeños con parada adaptativa (ver abajo). Validado
+# contra 250 iteraciones fijas en casquetes de 40°/75°/100°: mismo estiramiento
+# (p95 y área) con 20-25 iteraciones (10-15x menos tiempo). El tope evita
+# colgarse en mallas patológicas.
+SLIM_BATCH = 5
 SLIM_MAX_ITERS = 250
-SLIM_CONVERGE_TOL = 2e-3
+SLIM_MIN_ITERS = 15
+# Parada adaptativa: se mide el p95 del estiramiento por cara tras cada lote y
+# se detiene cuando mejora menos de SLIM_STRETCH_TOL durante SLIM_PATIENCE lotes
+# seguidos. (Medido: a ~20 iteraciones ya se está a ~0.3% del estiramiento
+# convergido, pero cada iteración cuesta mucho más en mallas grandes.)
+SLIM_STRETCH_TOL = 2.5e-3
+SLIM_PATIENCE = 2
+# Cache de resultados de SLIM por contenido de malla (V, F): re-aplanar tras
+# borrar un parche o cambiar opciones no recalcula los parches intactos.
+_SLIM_CACHE: "OrderedDict[str, np.ndarray]" = OrderedDict()
+_SLIM_CACHE_MAX = 16
 
 
 def _tutte_uniform_uv(
@@ -370,6 +382,15 @@ def _slim_uv(patch_id: int, V: np.ndarray, F: np.ndarray, areas_3d: np.ndarray) 
     # sobre el disco tapado; la salida usa F original (las aberturas se conservan).
     F_solve = _fill_inner_holes(V, F)
 
+    cache_key = hashlib.sha1(
+        np.ascontiguousarray(V, dtype=np.float64).tobytes()
+        + np.ascontiguousarray(F, dtype=np.int64).tobytes()
+    ).hexdigest()
+    cached = _SLIM_CACHE.get(cache_key)
+    if cached is not None:
+        _SLIM_CACHE.move_to_end(cache_key)
+        return cached.copy()
+
     Vf = np.asfortranarray(V[:, :3].astype(np.float64))
     Ff = np.asfortranarray(F_solve.astype(np.int32))
     boundary = igl.boundary_loop(F_solve)
@@ -391,13 +412,21 @@ def _slim_uv(patch_id: int, V: np.ndarray, F: np.ndarray, areas_3d: np.ndarray) 
         np.zeros(0, dtype=np.int32), np.zeros((0, 2)), 0.0,
     )
     uv = uv0
-    prev = None
-    for _ in range(0, SLIM_MAX_ITERS, SLIM_BATCH):
+    prev_metric, calm, done = None, 0, 0
+    while done < SLIM_MAX_ITERS:
         uv = np.asarray(igl.slim_solve(data, SLIM_BATCH))
-        scale = max(float(np.ptp(uv, axis=0).max()), 1e-9)
-        if prev is not None and np.abs(uv - prev).max() / scale < SLIM_CONVERGE_TOL:
+        done += SLIM_BATCH
+        s1, s2 = principal_stretches(V, F_solve, uv, F_solve)
+        metric = float(np.percentile(np.maximum(s1 - 1.0, 1.0 - s2), 95))
+        if not np.isfinite(metric):
+            continue
+        if prev_metric is not None and abs(prev_metric - metric) < SLIM_STRETCH_TOL:
+            calm += 1
+        else:
+            calm = 0
+        prev_metric = metric
+        if done >= SLIM_MIN_ITERS and calm >= SLIM_PATIENCE:
             break
-        prev = uv.copy()
 
     if _count_flips(uv, F_solve) > 0:
         raise FlattenError(
@@ -411,7 +440,11 @@ def _slim_uv(patch_id: int, V: np.ndarray, F: np.ndarray, areas_3d: np.ndarray) 
     total_3d, total_2d = float(areas_3d.sum()), float(_triangle_areas(uv, F).sum())
     if total_2d <= 0 or not np.all(np.isfinite(uv)):
         raise FlattenError(f"El aplanado del parche {patch_id} colapsó (área 0)")
-    return uv * np.sqrt(total_3d / total_2d)
+    uv = uv * np.sqrt(total_3d / total_2d)
+    _SLIM_CACHE[cache_key] = uv.copy()
+    while len(_SLIM_CACHE) > _SLIM_CACHE_MAX:
+        _SLIM_CACHE.popitem(last=False)
+    return uv
 
 
 # ----------------------------------------------------------- Desplegado rígido
@@ -631,14 +664,14 @@ def flatten_patch(patch_id: int, method: str = "unfold") -> dict:
     result = {
         "patch_id": patch_id,
         "method": method,
-        "uv": uv.tolist(),
+        "uv": np.round(uv, 2).tolist(),
         "faces": faces_2d.tolist(),
         "strain": np.round(strain, 1).tolist(),
         # Estiramientos principales por cara (σ1≥σ2) para el modo TOLERANCIA:
         # el frontend compara contra los límites warp/weft/compresión de la TDS.
         "s1": np.round(s1, 3).tolist(),
         "s2": np.round(s2, 3).tolist(),
-        "distortion": distortion.tolist(),
+        "distortion": np.round(distortion, 4).tolist(),
         "mean_distortion_pct": round(mean_pct, 2),
         "max_distortion_pct": round(float(deviation.max() * 100.0), 2),
         "tension_pct": round(float(np.percentile(tension, 95) * 100.0), 1),
@@ -675,7 +708,7 @@ def flatten_all_patches(method: str = "unfold") -> dict:
         patch = SESSION.patches[pid]
         patch["uv"][:, 0] += offset_x          # mover a su sitio en el layout
         patch["orig_to_uv"][:, 0] += offset_x
-        result["uv"] = patch["uv"].tolist()
+        result["uv"] = np.round(patch["uv"], 2).tolist()
         offset_x += patch["flatten_result"]["width_mm"] + PATCH_GAP_MM
         results.append(result)
 

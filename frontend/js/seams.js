@@ -150,6 +150,21 @@ const Seams = {
     setStatus(`Costura #${seam.seam_id} creada — los puntos quedan visibles`);
   },
 
+  // Restaura una costura ya registrada en el backend (al abrir un proyecto):
+  // línea + puntos de clic + cadena para imantar costuras nuevas.
+  restore(seam) {
+    const line = this._makeLine(seam.polyline);
+    Viewer.scene.add(line);
+    const markers = (seam.points || []).map(p => {
+      const m = this._makeMarker(new THREE.Vector3(...p));
+      Viewer.scene.add(m);
+      return m;
+    });
+    this.seamObjs.set(seam.seam_id, { line, markers, chain: this._chainOf(seam) });
+    (this._union ||= new Set());
+    if (seam.straighten) this._union.add(seam.seam_id);
+  },
+
   cancel() {
     if (!this.currentClicks.length) return setStatus('No hay costura en curso');
     this.cancelCurrent();
@@ -175,6 +190,7 @@ const Seams = {
   // Borra TODO (al cargar una malla nueva): costuras registradas + en curso
   resetAll() {
     this.stop();
+    if (this._union) this._union.clear();
     for (const obj of this.seamObjs.values()) this._removeSeamObjs(obj);
     this.seamObjs.clear();
     this.refreshList();

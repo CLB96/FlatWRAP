@@ -35,13 +35,106 @@ class SegmentationError(Exception):
     """No se puede segmentar (falta seleccionar la cara A, etc.)."""
 
 
-def _seam_edge_set(seams) -> set[tuple[int, int]]:
-    """Aristas cortadas por las costuras dadas, como pares ordenados."""
+def _seam_edge_set(seams, extensions=None) -> set[tuple[int, int]]:
+    """Aristas cortadas por las costuras dadas, como pares ordenados.
+
+    `extensions` ({seam_id: [(a, b), ...]}) son los tramos añadidos al hacer
+    snap de los extremos al borde de la Cara A (no modifican la costura).
+    """
     cut = set()
     for seam in seams:
         for a, b in seam.edge_path:
             cut.add((min(a, b), max(a, b)))
+        for a, b in (extensions or {}).get(seam.seam_id, ()):
+            cut.add((min(a, b), max(a, b)))
     return cut
+
+
+def _selection_boundary_vertices(mesh, selected_mask: np.ndarray) -> np.ndarray:
+    """Vértices en el borde de la Cara A (aristas con una sola cara seleccionada)."""
+    edges = np.asarray(mesh.edges_sorted)
+    face_of = np.arange(len(edges)) // 3
+    sel = selected_mask[face_of]
+    e = edges[sel]
+    if e.size == 0:
+        return np.empty(0, dtype=np.int64)
+    n = len(mesh.vertices)
+    keys, counts = np.unique(e[:, 0].astype(np.int64) * n + e[:, 1], return_counts=True)
+    b = keys[counts == 1]
+    return np.unique(np.concatenate([b // n, b % n]))
+
+
+def snap_seam_endpoints(mesh, selected_mask, seams, snap_mm: float):
+    """Prolonga los extremos de cada costura abierta hasta el borde de la Cara A.
+
+    Un extremo que queda a pocos mm del borde (o de otra costura) no separa
+    el parche y la costura "no corta". Aquí se busca, con Dijkstra sobre las
+    aristas de la Cara A y con radio máximo `snap_mm`, el vértice destino más
+    cercano (borde de la selección o vértice de otra costura) y se añade el
+    tramo mínimo. Devuelve ({seam_id: [aristas]}, [info]) y NO muta las costuras.
+    """
+    if snap_mm <= 0 or not seams:
+        return {}, []
+    from scipy.sparse.csgraph import dijkstra
+
+    n = len(mesh.vertices)
+    edges = np.asarray(mesh.edges_sorted)
+    sel_edges = np.unique(edges[selected_mask[np.arange(len(edges)) // 3]], axis=0)
+    if sel_edges.size == 0:
+        return {}, []
+    V = np.asarray(mesh.vertices)
+    w = np.linalg.norm(V[sel_edges[:, 0]] - V[sel_edges[:, 1]], axis=1)
+    graph = sp.csr_matrix((w, (sel_edges[:, 0], sel_edges[:, 1])), shape=(n, n))
+
+    boundary = _selection_boundary_vertices(mesh, selected_mask)
+    seam_verts = {
+        s.seam_id: set(int(v) for e in s.edge_path for v in e) for s in seams
+    }
+    in_sel_vertex = np.zeros(n, dtype=bool)
+    in_sel_vertex[np.unique(sel_edges)] = True
+
+    extensions: dict[int, list[tuple[int, int]]] = {}
+    info = []
+    for seam in seams:
+        if seam.closed or not seam.edge_path:
+            continue
+        # Extremos reales de la geodésica (primer y último vértice de la ruta)
+        ends = [int(seam.edge_path[0][0]), int(seam.edge_path[-1][1])]
+        if len(seam.vertex_ids) >= 2:
+            ends = [int(seam.vertex_ids[0]), int(seam.vertex_ids[-1])]
+        targets_other = set()
+        for sid, vs in seam_verts.items():
+            if sid != seam.seam_id:
+                targets_other |= vs
+        target_mask = np.zeros(n, dtype=bool)
+        target_mask[boundary] = True
+        if targets_other:
+            target_mask[np.fromiter(targets_other, dtype=np.int64)] = True
+        for end in ends:
+            if not in_sel_vertex[end] or target_mask[end]:
+                continue  # fuera de la Cara A, o ya toca borde/otra costura
+            dist, pred = dijkstra(
+                graph, directed=False, indices=end, limit=snap_mm,
+                return_predecessors=True,
+            )
+            cand = np.flatnonzero(target_mask & np.isfinite(dist))
+            if cand.size == 0:
+                info.append({"seam_id": seam.seam_id, "snapped": False,
+                             "reason": f"no hay borde a ≤ {snap_mm:g} mm"})
+                continue
+            t = int(cand[np.argmin(dist[cand])])
+            path = [t]
+            while path[-1] != end:
+                path.append(int(pred[path[-1]]))
+            ext = extensions.setdefault(seam.seam_id, [])
+            for a, b in zip(path[:-1], path[1:]):
+                ext.append((a, b))
+            info.append({
+                "seam_id": seam.seam_id, "snapped": True,
+                "dist_mm": round(float(dist[t]), 2),
+                "polyline": [[round(float(c), 3) for c in V[v]] for v in path[::-1]],
+            })
+    return extensions, info
 
 
 def _components_within(
@@ -132,7 +225,7 @@ def _fill_selection_holes(mesh, selected_mask: np.ndarray) -> np.ndarray:
     return filled
 
 
-def segment_by_seams(selected_faces: list[int]) -> dict:
+def segment_by_seams(selected_faces: list[int], snap_mm: float = 5.0) -> dict:
     """Subdivide la cara A seleccionada por las costuras activas."""
     mesh = SESSION.mesh
     if not selected_faces:
@@ -150,8 +243,9 @@ def segment_by_seams(selected_faces: list[int]) -> dict:
     SESSION.selected_faces = selected_mask
 
     seams = list(SESSION.seams.values())
+    extensions, snap_info = snap_seam_endpoints(mesh, selected_mask, seams, snap_mm)
     n_patches, labels, n_dropped = _components_within(
-        mesh, selected_mask, _seam_edge_set(seams)
+        mesh, selected_mask, _seam_edge_set(seams, extensions)
     )
 
     # Warnings: costura que al quitarla no cambia el número de patrones
@@ -159,13 +253,21 @@ def segment_by_seams(selected_faces: list[int]) -> dict:
     for seam in seams:
         others = [s for s in seams if s.seam_id != seam.seam_id]
         n_without, _, _ = _components_within(
-            mesh, selected_mask, _seam_edge_set(others)
+            mesh, selected_mask, _seam_edge_set(others, extensions)
         )
         if n_without == n_patches:
             warnings.append(
                 f"La costura #{seam.seam_id} no separa la Cara A en dos piezas "
                 "(pero puede seguir sirviendo para abrir la superficie al desplegar)."
             )
+
+    for si in snap_info:
+        if not si["snapped"]:
+            continue
+        warnings.append(
+            f"Costura #{si['seam_id']}: extremo prolongado {si['dist_mm']} mm hasta el "
+            "borde para que corte (ajusta la tolerancia de snap si no lo quieres)."
+        )
 
     if n_dropped:
         warnings.append(
@@ -207,4 +309,5 @@ def segment_by_seams(selected_faces: list[int]) -> dict:
             for pid, p in sorted(SESSION.patches.items())
         ],
         "warnings": warnings,
+        "snaps": [i for i in snap_info if i["snapped"]],
     }

@@ -144,6 +144,14 @@ def subdivide_current() -> MeshSummary:
     return _summary(new_mesh)
 
 
+def geometry_binary(mesh: trimesh.Trimesh) -> bytes:
+    """[nV u32][nF u32][vértices float32 (nV*3)][caras uint32 (nF*3)], little-endian."""
+    v = np.ascontiguousarray(mesh.vertices, dtype="<f4")
+    f = np.ascontiguousarray(mesh.faces, dtype="<u4")
+    header = np.array([len(v), len(f)], dtype="<u4").tobytes()
+    return header + v.tobytes() + f.tobytes()
+
+
 def geometry_payload(mesh: trimesh.Trimesh) -> dict:
     """Geometría plana (Float32/Uint32) lista para BufferGeometry de Three.js."""
     return {
