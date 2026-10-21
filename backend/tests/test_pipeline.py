@@ -781,3 +781,29 @@ def test_api_gzip_and_binary_geometry(cylinder_session):
     assert r.status_code == 200 and r.content == mesh_io.geometry_binary(SESSION.mesh)
     big = c.get("/api/mesh/geometry", headers={"Accept-Encoding": "gzip"})
     assert big.headers.get("content-encoding") == "gzip"
+
+
+def test_relax_rejects_collapsed_flatten(cylinder_session, monkeypatch):
+    # Un relajado colapsado (tensión p95 enorme) NO se entrega como patrón válido:
+    # error accionable con diagnóstico de cuánto envuelve la Cara A.
+    segmentation.segment_by_seams(_all_faces())
+    real = flattening.principal_stretches
+
+    def junk(V, f_src, uv, f_tgt):
+        s1, s2 = real(V, f_src, uv, f_tgt)
+        return s1 * 50.0, s2
+
+    monkeypatch.setattr(flattening, "principal_stretches", junk)
+    with pytest.raises(flattening.FlattenError, match="colapsado"):
+        flattening.flatten_patch(0, "relax")
+
+
+def test_pinch_vertices_and_islands_are_cleaned():
+    # Dos triángulos unidos solo por un vértice (8): el pellizco se divide y la isla
+    # chica se descarta; el resultado es una sola componente sin vértices pellizco.
+    V = np.array([[0, 0, 0], [10, 0, 0], [0, 10, 0], [10, 10, 0], [-10, 0, 0], [0, -1, 0]], float)
+    F = np.array([[0, 1, 2], [1, 3, 2], [0, 4, 5]])   # (0,4,5) toca el resto solo en el vértice 0
+    V2, F2, to = flattening._split_pinch_vertices(V, F)
+    assert len(V2) == len(V) + 1
+    V3, F3, to3 = flattening._largest_face_component(V2, F2)
+    assert len(F3) == 2 and len(set(F3.ravel())) == 4

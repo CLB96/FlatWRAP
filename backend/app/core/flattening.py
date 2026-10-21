@@ -32,6 +32,7 @@ from collections import OrderedDict, defaultdict, deque
 import igl
 import numpy as np
 import scipy.sparse as sp
+from scipy.sparse.csgraph import connected_components as connected_components_cs
 import scipy.sparse.linalg as spla
 import trimesh
 
@@ -186,6 +187,39 @@ _SLIM_CACHE: "OrderedDict[str, np.ndarray]" = OrderedDict()
 _SLIM_CACHE_MAX = 16
 
 
+def _boundary_ellipse_uv(V: np.ndarray, boundary: np.ndarray) -> np.ndarray:
+    """Borde -> ELIPSE con la proporción de la pieza (init de Tutte).
+
+    Un círculo comprime exponencialmente las piezas alargadas (tiras de 6:1: las
+    caras de los extremos quedan con áreas de 1e-20 y se degeneran/voltean). Una
+    elipse con semiejes ∝ extensión PCA de la pieza sigue siendo convexa (Tutte
+    sigue garantizando 0 volteos) pero reparte el área parejo. Los dos extremos
+    de la pieza (a lo largo del eje mayor) se anclan en θ=0 y θ=π y cada mitad
+    del borde se reparte por longitud de arco, así el orden es monótono (convexo
+    estricto) y conserva la orientación del borde. En mm: cerca de la escala 3D.
+    """
+    pts = V[boundary]
+    allc = V - V.mean(axis=0)
+    _, _, vt = np.linalg.svd(allc[:: max(1, len(V) // 20000)], full_matrices=False)
+    c1, c2 = allc @ vt[0], allc @ vt[1]
+    a1 = max(float(np.ptp(c1)) / 2.0, 1e-6)
+    a2 = max(float(np.ptp(c2)) / 2.0, a1 * 0.05)
+    b1 = (pts - V.mean(axis=0)) @ vt[0]
+    iA, iB = int(np.argmax(b1)), int(np.argmin(b1))
+    n = len(boundary)
+    seg = np.linalg.norm(pts - np.roll(pts, -1, axis=0), axis=1)   # i -> i+1
+    cum = np.concatenate([[0.0], np.cumsum(seg)])                  # cum[i] = arco hasta i
+    total = cum[-1]
+    pos = np.mod(cum[:n] - cum[iA], total)                          # arco desde A (0..total)
+    sAB = pos[iB]
+    theta = np.where(
+        pos <= sAB,
+        np.pi * pos / max(sAB, 1e-12),
+        np.pi + np.pi * (pos - sAB) / max(total - sAB, 1e-12),
+    )
+    return np.column_stack([a1 * np.cos(theta), a2 * np.sin(theta)])
+
+
 def _tutte_uniform_uv(
     V: np.ndarray, F: np.ndarray, boundary: np.ndarray, bnd_uv: np.ndarray
 ) -> np.ndarray:
@@ -205,6 +239,45 @@ def _tutte_uniform_uv(
     adj = sp.csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(n, n))
     deg = np.asarray(adj.sum(axis=1)).ravel()
     lap = sp.diags(deg) - adj
+    interior = np.setdiff1d(np.arange(n), boundary)
+    uv = np.zeros((n, 2))
+    uv[boundary] = bnd_uv
+    if interior.size:
+        lii = lap[interior][:, interior].tocsc()
+        lib = lap[interior][:, boundary]
+        uv[interior] = spla.spsolve(lii, -(lib @ bnd_uv))
+    return uv
+
+
+def _tutte_mvc_uv(
+    V: np.ndarray, F: np.ndarray, boundary: np.ndarray, bnd_uv: np.ndarray
+) -> np.ndarray:
+    """Init de Floater con pesos de VALOR MEDIO (mean value coordinates).
+
+    Los pesos uniformes de Tutte ignoran la geometría: una región densa unida al
+    resto por un cuello angosto se contrae a un punto (áreas ~1e-20 -> volteos
+    falsos). Los pesos de valor medio w_ij = (tan(a/2)+tan(b/2))/|vi-vj| son
+    SIEMPRE positivos (triángulos obtusos incluidos), por lo que conservan la
+    garantía de embedding sin volteos con borde convexo, pero reparten el área
+    según la geometría 3D real.
+    """
+    n = len(V)
+    P = V[F]                                   # (m, 3, 3)
+    rows, cols, vals = [], [], []
+    for c in range(3):
+        a, b, d = P[:, c], P[:, (c + 1) % 3], P[:, (c + 2) % 3]
+        u, v = b - a, d - a
+        lu, lv = np.linalg.norm(u, axis=1), np.linalg.norm(v, axis=1)
+        cross = np.linalg.norm(np.cross(u, v), axis=1)
+        t = cross / np.maximum(lu * lv + (u * v).sum(1), 1e-30)   # tan(alfa/2)
+        i, j, k = F[:, c], F[:, (c + 1) % 3], F[:, (c + 2) % 3]
+        rows += [i, i]
+        cols += [j, k]
+        vals += [t / np.maximum(lu, 1e-12), t / np.maximum(lv, 1e-12)]
+    W = sp.csr_matrix(
+        (np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), shape=(n, n)
+    )
+    lap = sp.diags(np.asarray(W.sum(axis=1)).ravel()) - W
     interior = np.setdiff1d(np.arange(n), boundary)
     uv = np.zeros((n, 2))
     uv[boundary] = bnd_uv
@@ -325,42 +398,165 @@ def _earclip_2d(P: np.ndarray) -> list[tuple[int, int, int]] | None:
     return tris
 
 
-def _fill_inner_holes(V: np.ndarray, F: np.ndarray) -> np.ndarray:
-    """Tapa los huecos INTERIORES del parche (aberturas: agujeros, slots) SOLO
-    para el solve de SLIM, sin añadir vértices (recorte de orejas en el plano de
-    cada hueco). Devuelve F con caras extra; el llamador usa F original para la
-    salida, así las aberturas quedan en el patrón pero ya no distorsionan el
-    aplanado. Si el parche es un disco simple (≤1 borde) no hace nada.
+def _split_pinch_vertices(V: np.ndarray, F: np.ndarray):
+    """Divide los vértices PELLIZCO (vértice de borde compartido por 2+ abanicos de
+    caras que solo se tocan en ese vértice, como un 8). Rompen el encadenado de
+    bordes y la topología de disco que necesita SLIM. Cada abanico extra recibe
+    una copia del vértice. Devuelve (V2, F2, to_orig) con to_orig[i] = índice
+    del vértice original (identidad si no hay pellizcos).
+    """
+    ec: dict = defaultdict(int)
+    for f in F:
+        for a, b in ((f[0], f[1]), (f[1], f[2]), (f[2], f[0])):
+            ec[(min(int(a), int(b)), max(int(a), int(b)))] += 1
+    bdeg: dict = defaultdict(int)
+    for (a, b), c in ec.items():
+        if c == 1:
+            bdeg[a] += 1
+            bdeg[b] += 1
+    pinch = [v for v, d in bdeg.items() if d > 2]
+    to_orig = np.arange(len(V))
+    if not pinch:
+        return V, F, to_orig
+    F2 = F.copy()
+    newV, new_to = [], []
+    vert_faces: dict = defaultdict(list)
+    for fi, f in enumerate(F):
+        for v in f:
+            if int(v) in pinch:
+                vert_faces[int(v)].append(fi)
+    for v in pinch:
+        faces = vert_faces[v]
+        # abanicos: caras conectadas por una arista interior (v,x) compartida
+        edge_faces: dict = defaultdict(list)
+        for fi in faces:
+            for x in F[fi]:
+                if int(x) != v:
+                    edge_faces[int(x)].append(fi)
+        parent = {fi: fi for fi in faces}
+
+        def find(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+
+        for fs in edge_faces.values():
+            for other in fs[1:]:
+                parent[find(other)] = find(fs[0])
+        groups: dict = defaultdict(list)
+        for fi in faces:
+            groups[find(fi)].append(fi)
+        for gfaces in list(groups.values())[1:]:
+            nid = len(V) + len(newV)
+            newV.append(V[v])
+            new_to.append(v)
+            for fi in gfaces:
+                F2[fi][F2[fi] == v] = nid
+    V2 = np.vstack([V, np.asarray(newV)])
+    return V2, F2, np.concatenate([to_orig, np.asarray(new_to, dtype=to_orig.dtype)])
+
+
+def _largest_face_component(V: np.ndarray, F: np.ndarray):
+    """Se queda con la componente de caras (conexa por ARISTAS) de mayor área.
+
+    Tras dividir los pellizcos, triángulos sueltos o islas unidas al parche solo
+    por un vértice quedan desconectados: no se pueden aplanar junto con el resto
+    (y su lazo de 3 aristas, al "taparse", crea una cara duplicada que colapsa la
+    init). Se descartan y se compactan los vértices. Devuelve (V2, F2, to_orig).
+    """
+    m = len(F)
+    ekey: dict = {}
+    rows, cols = [], []
+    for fi in range(m):
+        a, b, c = int(F[fi, 0]), int(F[fi, 1]), int(F[fi, 2])
+        for u, w in ((a, b), (b, c), (c, a)):
+            k = (u, w) if u < w else (w, u)
+            if k in ekey:
+                rows.append(ekey[k])
+                cols.append(fi)
+            else:
+                ekey[k] = fi
+    g = sp.csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(m, m))
+    ncomp, lab = connected_components_cs(g)
+    if ncomp == 1:
+        return V, F, np.arange(len(V))
+    area = _triangle_areas(V, F)
+    keep_lab = int(np.argmax(np.bincount(lab, weights=area)))
+    F1 = F[lab == keep_lab]
+    used, inv = np.unique(F1, return_inverse=True)
+    return V[used], inv.reshape(-1, 3), used
+
+
+def _fill_inner_holes(V: np.ndarray, F: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Tapa los huecos INTERIORES del parche (aberturas: agujeros, slots, bolsillos)
+    SOLO para el solve de SLIM. Devuelve (V_solve, F_solve): el llamador usa V/F
+    originales para la salida, así las aberturas quedan en el patrón pero ya no
+    distorsionan el aplanado.
+
+    Cada hueco se tapa con un abanico desde un vértice nuevo en el centroide de su
+    borde (siempre triangula). Un parche con bordes múltiples sin tapar es
+    multiplemente conexo y SLIM lo pellizca/colapsa; por eso NO es todo-o-nada
+    por hueco (antes un solo hueco no plano impedía tapar los otros 30).
+    Si el parche ya es un disco simple (≤1 borde) no hace nada.
     """
     loops = _boundary_loops_simple(F)
     if len(loops) <= 1:
-        return F
+        return V, F
     loops.sort(key=len, reverse=True)        # el mayor = borde exterior
     extra: list = []
+    new_verts: list = []
+    n0 = len(V)
     for loop in loops[1:]:
         if len(loop) < 3:
             continue
         pts = V[loop]
         c = pts.mean(axis=0)
-        _, _, vt = np.linalg.svd(pts - c, full_matrices=False)
-        tris = _earclip_2d((pts - c) @ vt[:2].T)
-        if tris is None:
-            continue                         # hueco no simple: best-effort
-        for i, j, k in tris:
-            extra.append([loop[i], loop[j], loop[k]])
+        # Abanico desde el centroide: siempre triangula y nunca crea caras duplicadas
+        # (el recorte de orejas en un plano sí, en bordes con "espolones": una cara
+        # existente que sobresale hacia el hueco se duplicaba y colapsaba la init).
+        cid = n0 + len(new_verts)
+        new_verts.append(c)
+        m = len(loop)
+        for i in range(m):
+            extra.append([loop[i], loop[(i + 1) % m], cid])
     if not extra:
-        return F
+        return V, F
+    V2 = np.vstack([V, np.asarray(new_verts)]) if new_verts else V
     F2 = np.vstack([F, np.asarray(extra, dtype=F.dtype)])
-    # Winding consistente (las orejas pueden quedar invertidas vs la superficie)
-    tmp = trimesh.Trimesh(vertices=V, faces=F2, process=False)
+    # Winding consistente (las orejas/abanicos pueden quedar invertidos vs la superficie)
+    tmp = trimesh.Trimesh(vertices=V2, faces=F2, process=False)
     tmp.fix_normals()
     F2 = np.asarray(tmp.faces)
-    # TODO-O-NADA: solo usar el relleno si quedó un DISCO simple (1 borde). Si
-    # algún hueco no se pudo triangular (rim muy no-plano), NO se toca el parche
-    # (se resuelve como antes) -> garantiza que nunca empeora un caso que servía.
+    # Debe quedar un DISCO simple (1 borde); si no, no se toca el parche.
     if len(_boundary_loops_simple(F2)) != 1:
-        return F
-    return F2
+        return V, F
+    return V2, F2
+
+
+def _run_slim(Vf, Ff, V_solve, F_solve, uv0) -> np.ndarray:
+    """Itera SLIM en lotes con parada adaptativa por estiramiento p95."""
+    data = igl.slim_precompute(
+        Vf, Ff, np.asfortranarray(uv0), igl.SYMMETRIC_DIRICHLET,
+        np.zeros(0, dtype=np.int32), np.zeros((0, 2)), 0.0,
+    )
+    uv = uv0
+    prev_metric, calm, done = None, 0, 0
+    while done < SLIM_MAX_ITERS:
+        uv = np.asarray(igl.slim_solve(data, SLIM_BATCH))
+        done += SLIM_BATCH
+        s1, s2 = principal_stretches(V_solve, F_solve, uv, F_solve)
+        metric = float(np.percentile(np.maximum(s1 - 1.0, 1.0 - s2), 95))
+        if not np.isfinite(metric):
+            continue
+        if prev_metric is not None and abs(prev_metric - metric) < SLIM_STRETCH_TOL:
+            calm += 1
+        else:
+            calm = 0
+        prev_metric = metric
+        if done >= SLIM_MIN_ITERS and calm >= SLIM_PATIENCE:
+            break
+    return uv
 
 
 def _slim_uv(patch_id: int, V: np.ndarray, F: np.ndarray, areas_3d: np.ndarray) -> np.ndarray:
@@ -380,8 +576,6 @@ def _slim_uv(patch_id: int, V: np.ndarray, F: np.ndarray, areas_3d: np.ndarray) 
     # Tapar huecos interiores (aberturas) SOLO para el solve: un parche con
     # agujeros es multiplemente-conexo y SLIM lo contrae/pellizca. Se resuelve
     # sobre el disco tapado; la salida usa F original (las aberturas se conservan).
-    F_solve = _fill_inner_holes(V, F)
-
     cache_key = hashlib.sha1(
         np.ascontiguousarray(V, dtype=np.float64).tobytes()
         + np.ascontiguousarray(F, dtype=np.int64).tobytes()
@@ -391,7 +585,9 @@ def _slim_uv(patch_id: int, V: np.ndarray, F: np.ndarray, areas_3d: np.ndarray) 
         _SLIM_CACHE.move_to_end(cache_key)
         return cached.copy()
 
-    Vf = np.asfortranarray(V[:, :3].astype(np.float64))
+    V_solve, F_solve = _fill_inner_holes(V, F)
+
+    Vf = np.asfortranarray(V_solve[:, :3].astype(np.float64))
     Ff = np.asfortranarray(F_solve.astype(np.int32))
     boundary = igl.boundary_loop(F_solve)
     if boundary.size == 0:
@@ -400,40 +596,41 @@ def _slim_uv(patch_id: int, V: np.ndarray, F: np.ndarray, areas_3d: np.ndarray) 
             "que lo abra (o que corte el lazo) para poder aplanarlo."
         )
 
-    bnd_uv = igl.map_vertices_to_circle(Vf, boundary)
-    uv0 = _tutte_uniform_uv(V, F_solve, boundary, bnd_uv)
-    if not np.all(np.isfinite(uv0)):
-        raise FlattenError(
-            f"La inicialización del parche {patch_id} falló (malla degenerada)."
+    # Inicializaciones candidatas (la 1a que arranque y termine sin volteos gana):
+    #   b) Tutte uniforme + borde CÍRCULO: clásica, converge rápido (la de siempre)
+    #   a) valor medio + borde ELIPSE: respaldo para piezas alargadas/irregulares
+    #      donde la clásica se degenera (cuellos angostos -> áreas ~1e-20 -> volteos)
+    def _init_a():
+        return _tutte_mvc_uv(V_solve, F_solve, boundary, _boundary_ellipse_uv(V_solve, boundary))
+
+    def _init_b():
+        return _tutte_uniform_uv(
+            V_solve, F_solve, boundary, igl.map_vertices_to_circle(Vf, boundary)
         )
 
-    data = igl.slim_precompute(
-        Vf, Ff, np.asfortranarray(uv0), igl.SYMMETRIC_DIRICHLET,
-        np.zeros(0, dtype=np.int32), np.zeros((0, 2)), 0.0,
-    )
-    uv = uv0
-    prev_metric, calm, done = None, 0, 0
-    while done < SLIM_MAX_ITERS:
-        uv = np.asarray(igl.slim_solve(data, SLIM_BATCH))
-        done += SLIM_BATCH
-        s1, s2 = principal_stretches(V, F_solve, uv, F_solve)
-        metric = float(np.percentile(np.maximum(s1 - 1.0, 1.0 - s2), 95))
-        if not np.isfinite(metric):
-            continue
-        if prev_metric is not None and abs(prev_metric - metric) < SLIM_STRETCH_TOL:
-            calm += 1
-        else:
-            calm = 0
-        prev_metric = metric
-        if done >= SLIM_MIN_ITERS and calm >= SLIM_PATIENCE:
+    uv, any_init = None, False
+    for make_init in (_init_b, _init_a):
+        uv0 = make_init()
+        if not np.all(np.isfinite(uv0)) or _count_flips(uv0, F_solve) > 0:
+            continue                     # init con volteos: SLIM no puede deshacerlos
+        any_init = True
+        cand = _run_slim(Vf, Ff, V_solve, F_solve, uv0)
+        if _count_flips(cand, F_solve) == 0 and np.all(np.isfinite(cand)):
+            uv = cand
             break
-
-    if _count_flips(uv, F_solve) > 0:
+    if uv is None:
+        if not any_init:
+            raise FlattenError(
+                f"No se pudo construir un punto de partida sin volteos para el parche "
+                f"{patch_id}: la superficie envuelve sobre sí misma o tiene triángulos "
+                "degenerados. Agrega una costura que la ABRA (o limpia la Cara A)."
+            )
         raise FlattenError(
             f"El parche {patch_id} no se pudo aplanar sin volteos: la superficie "
             "envuelve sobre sí misma. Agrega una costura que la ABRA y vuelve a generar."
         )
 
+    uv = uv[: len(V)]          # quitar vértices auxiliares de los abanicos de hueco
     centered = uv - uv.mean(axis=0)
     _, _, vt = np.linalg.svd(centered, full_matrices=False)
     uv = centered @ vt.T
@@ -612,6 +809,24 @@ def _net_overlaps(coords: np.ndarray, faces_2d: np.ndarray, total_area: float) -
 
 
 # ----------------------------------------------------------- Despacho
+# Un "relajado" con tensión p95 por encima de esto no es un patrón utilizable
+# (casos reales: +9833%): es un aplanado colapsado que SLIM no marca como volteo.
+RELAX_MAX_TENSION_P95_PCT = 200.0
+
+
+def _wrap_hint(mesh) -> str:
+    """Diagnóstico corto de por qué una Cara A no aplana: cuánto 'envuelve'."""
+    try:
+        n, a = np.asarray(mesh.face_normals), np.asarray(mesh.area_faces)
+        mean = (n * a[:, None]).sum(axis=0)
+        mean /= max(float(np.linalg.norm(mean)), 1e-12)
+        ang = np.degrees(np.arccos(np.clip(n @ mean, -1.0, 1.0)))
+        pct = 100.0 * float(a[ang > 90.0].sum() / max(a.sum(), 1e-12))
+        return f" ({pct:.0f}% del área mira más de 90° respecto a la dirección media)"
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def flatten_patch(patch_id: int, method: str = "unfold") -> dict:
     """Aplana un parche con el método dado -> UV en mm + distorsión."""
     patch = SESSION.patches[patch_id]  # KeyError -> 404 en la ruta
@@ -626,12 +841,21 @@ def flatten_patch(patch_id: int, method: str = "unfold") -> dict:
         V, F, cut_to_orig = _cut_mesh_along_edges(V0, F0, cut_edges)
     else:
         V, F, cut_to_orig = V0, F0, np.arange(len(V0))
+    # Vértices pellizco (borde en forma de 8): se dividen para que el parche sea
+    # un disco (con huecos) y no un lazo de borde partido en dos.
+    V, F, split_to_orig = _split_pinch_vertices(V, F)
+    cut_to_orig = cut_to_orig[split_to_orig]
+    V, F, keep_to_orig = _largest_face_component(V, F)   # descarta islas sueltas
+    cut_to_orig = cut_to_orig[keep_to_orig]
     work_mesh = trimesh.Trimesh(vertices=V, faces=F, process=False)
     areas_3d = _triangle_areas(V, F)
 
     overlap = False
     if method == "relax":
-        uv = _slim_uv(patch_id, V, F, areas_3d)
+        try:
+            uv = _slim_uv(patch_id, V, F, areas_3d)
+        except FlattenError as e:
+            raise FlattenError(f"{e}{_wrap_hint(mesh)}") from e
         faces_2d, vert_to_uv = F, uv
     elif method == "project":
         uv = _project_uv(V, _mean_normal(work_mesh, areas_3d))
@@ -680,6 +904,13 @@ def flatten_patch(patch_id: int, method: str = "unfold") -> dict:
         "width_mm": round(float(uv[:, 0].max()), 1),
         "height_mm": round(float(uv[:, 1].max()), 1),
     }
+    if method == "relax" and result["tension_pct"] > RELAX_MAX_TENSION_P95_PCT:
+        raise FlattenError(
+            f"El aplanado relajado del parche {patch_id} quedó colapsado "
+            f"(tensión p95 +{result['tension_pct']:.0f}%): la Cara A envuelve sobre sí "
+            f"misma{_wrap_hint(mesh)}. Agrega costuras que la abran en piezas más "
+            "planas, o prueba Desplegado / Proyección."
+        )
     patch["uv"] = uv
     patch["faces_2d"] = np.asarray(faces_2d)
     patch["orig_to_uv"] = orig_to_uv
